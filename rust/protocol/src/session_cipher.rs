@@ -42,7 +42,7 @@ pub async fn message_encrypt<R: Rng + CryptoRng>(
         )
     })?;
     let message_keys = chain_key.message_keys().generate_keys(pqr_key);
-
+    //这是用于非对称棘轮更新的密钥
     let sender_ephemeral = session_state.sender_ratchet_key()?;
     let previous_counter = session_state.previous_counter();
     let session_version = session_state
@@ -100,7 +100,7 @@ pub async fn message_encrypt<R: Rng + CryptoRng>(
             &their_identity_key,
             &pqr_msg,
         )?;
-
+        //  Kyber PreKey ID + 密文
         let kyber_payload = items
             .kyber_pre_key_id()
             .zip(items.kyber_ciphertext())
@@ -129,7 +129,7 @@ pub async fn message_encrypt<R: Rng + CryptoRng>(
             &pqr_msg,
         )?)
     };
-
+    //推进发送链
     session_state.set_sender_chain_key(&chain_key.next_chain_key());
 
     // XXX why is this check after everything else?!!
@@ -207,12 +207,23 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
     csprng: &mut R,
     use_pq_ratchet: UsePQRatchet,
 ) -> Result<Vec<u8>> {
+    //1. 加载或创建会话记录
     let mut session_record = session_store
         .load_session(remote_address)
         .await?
-        .unwrap_or_else(SessionRecord::new_fresh);
-
+        .unwrap_or_else(SessionRecord::new_fresh);//没有就新创建
+    //返回被使用的 pre_key_id 和 kyber_pre_key_id，用于后续清理。
     // Make sure we log the session state if we fail to process the pre-key.
+
+    //2。处理prekey信息
+    //     这是 最关键的一步，内部通常执行以下操作：
+
+    // ✅ X3DH / PQXDH 密钥协商（根据 use_pq_ratchet）：
+    // 验证对方的 身份公钥（Identity Key） 签名。
+    // 验证 Signed PreKey 的签名（防篡改）。
+    // （若启用 PQ）验证 Kyber PreKey。
+    // 执行多轮 DH 计算，派生出 初始根密钥（Root Key） 和 发送/接收链初始状态。
+    // 构建完整的 SessionState 并存入 session_record。
     let process_prekey_result = session::process_prekey(
         ciphertext,
         remote_address,
@@ -224,6 +235,8 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
         use_pq_ratchet,
     )
     .await;
+
+
 
     let (pre_key_used, identity_to_save) = match process_prekey_result {
         Ok(result) => result,
@@ -239,10 +252,16 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
                 )?
             );
             let [e] = errs;
-            return Err(e);
+            return Err(e);//结束
         }
     };
 
+    //调用通用解密函数，传入刚初始化的 session_record。
+    // 内部会：
+    // 从 SessionState 中获取接收链密钥；
+    // 根据消息中的 counter（消息序号）派生 MessageKey；
+    // 使用 AES-GCM / AES-CBC + HMAC 解密消息体；
+    // 更新接收链状态（推进链索引）。
     let ptext = decrypt_message_with_record(
         remote_address,
         &mut session_record,
@@ -250,7 +269,8 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
         CiphertextMessageType::PreKey,
         csprng,
     )?;
-
+// 保存身份：将对方的身份公钥与地址绑定，用于未来消息的身份验证（防止中间人攻击）。
+// 保存会话：将新建立或更新的会话状态写回存储，供后续消息使用。
     identity_store
         .save_identity(
             identity_to_save.remote_address,
@@ -261,11 +281,12 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
     session_store
         .store_session(remote_address, &session_record)
         .await?;
-
+    //     一次性预密钥（PreKey） 只能使用一次，用完即删，保证前向保密。
+    // Kyber 预密钥 同理，标记为“已使用”（可能延迟删除，但不再用于新会话）。
     if let Some(pre_key_id) = pre_key_used.pre_key_id {
         pre_key_store.remove_pre_key(pre_key_id).await?;
     }
-
+    //
     if let Some(kyber_pre_key_id) = pre_key_used.kyber_pre_key_id {
         kyber_pre_key_store
             .mark_kyber_pre_key_used(kyber_pre_key_id)
@@ -419,6 +440,23 @@ fn create_decryption_failure_log(
     Ok(lines.join("\n"))
 }
 
+/*
+record: 包含 当前会话状态 + 多个历史会话状态 的会话记录（SessionRecord）。
+ciphertext: 要解密的加密消息（SignalMessage，内含 sender_ratchet_key, counter, ciphertext 等）。
+original_message_type: 消息原始类型（PreKey 或 Whisper），用于错误上下文
+
+
+先尝试用当前会话状态解密
+成功 → 更新状态并返回明文。
+失败但非“重复消息” → 记录错误，继续。
+是 DuplicatedMessage → 立即返回（不重试旧会话）。
+若当前会话失败，遍历所有历史会话状态（previous sessions）
+逐个尝试解密。
+成功 → 将该历史会话 提升为当前会话（promote_old_session）。
+全部失败 → 报错。
+统一错误处理：生成详细日志，返回 InvalidMessage
+
+*/
 fn decrypt_message_with_record<R: Rng + CryptoRng>(
     remote_address: &ProtocolAddress,
     record: &mut SessionRecord,
@@ -696,22 +734,30 @@ fn get_or_create_chain_key<R: Rng + CryptoRng>(
     remote_address: &ProtocolAddress,
     csprng: &mut R,
 ) -> Result<ChainKey> {
+    // 尝试复用已有接收链
+    //检查是否已经为该 their_ephemeral 公钥建立过接收链（receiver chain）。
+    // 如果存在，直接返回已有的 ChainKey，避免重复派生。
+    // 这对应于  Signal 协议中的“乱序消息处理”场景：同一发送方可能在未收到回复前连续发送多条消息，使用相同的临时密钥。
     if let Some(chain) = state.get_receiver_chain_key(their_ephemeral)? {
         log::debug!("{remote_address} has existing receiver chain.");
         return Ok(chain);
     }
-
+    //非对称棘轮被动更新
     log::info!("{remote_address} creating new chains.");
-
+    //  获取当前根密钥和我方临时私钥
     let root_key = state.root_key()?;
     let our_ephemeral = state.sender_ratchet_private_key()?;
+    // 与对方公钥执行 DH，派生接收链
     let receiver_chain = root_key.create_chain(their_ephemeral, &our_ephemeral)?;
+    // 生成我方新的临时密钥对，并派生发送链
     let our_new_ephemeral = KeyPair::generate(csprng);
+    //发送链的根密钥从初始化的接收链导出
     let sender_chain = receiver_chain
         .0
         .create_chain(their_ephemeral, &our_new_ephemeral.private_key)?;
-
+    //重置根密钥
     state.set_root_key(&sender_chain.0);
+    //添加接收链
     state.add_receiver_chain(their_ephemeral, &receiver_chain.1);
 
     let current_index = state.get_sender_chain_key()?.index();
@@ -735,7 +781,15 @@ fn get_or_create_message_key(
     counter: u32,
 ) -> Result<MessageKeyGenerator> {
     let chain_index = chain_key.index();
+    //  第一步：检查是否为重复消息（counter < 当前链索引）
 
+    /*
+    先尝试从 已缓存的消息密钥表 中查找 counter 对应的密钥。
+    若存在 → 返回（允许解密重传消息）。
+    若不存在 → 报错 DuplicatedMessage。
+    因为按协议，只有最近 MAX_MESSAGE_KEYS 条消息的密钥会被缓存（防存储耗尽）。
+    超出缓存范围的“旧消息”无法解密，视为无效或攻击。
+     */
     if chain_index > counter {
         return match state.get_message_keys(their_ephemeral, counter)? {
             Some(keys) => Ok(keys),
@@ -749,7 +803,7 @@ fn get_or_create_message_key(
     assert!(chain_index <= counter);
 
     let jump = (counter - chain_index) as usize;
-
+    // v第二步：检查是否跳号过多（防止 DoS）
     if jump > MAX_FORWARD_JUMPS {
         if state.session_with_self()? {
             log::info!(
@@ -767,7 +821,12 @@ fn get_or_create_message_key(
     }
 
     let mut chain_key = chain_key.clone();
-
+    // 第三步：向前推进链，派生中间消息密钥
+    /*
+    从当前 chain_index 开始，逐次派生直到 counter - 1 的所有 MessageKey。
+    将这些中间密钥 缓存到 state 中（供可能的乱序消息使用）。
+    最终 chain_key 停在 index == counter
+     */
     while chain_key.index() < counter {
         let message_keys = chain_key.message_keys();
         state.set_message_keys(their_ephemeral, message_keys)?;

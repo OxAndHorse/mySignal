@@ -52,19 +52,22 @@
 //!
 //! ```
 //!
+//! 
+// 声明子模块
 mod kyber1024;
 #[cfg(any(feature = "kyber768", test))]
 mod kyber768;
 #[cfg(feature = "mlkem1024")]
 mod mlkem1024;
 
+//引入外部依赖
 use std::marker::PhantomData;
 
 use derive_where::derive_where;
 use displaydoc::Display;
 use rand::{CryptoRng, Rng};
 use subtle::ConstantTimeEq;
-
+//内部依赖
 use crate::{Result, SignalProtocolError};
 
 type SharedSecret = Box<[u8]>;
@@ -85,6 +88,7 @@ pub type SerializedCiphertext = Box<[u8]>;
 ///     // ...
 /// }
 /// ```
+//顶层接口，定义了实现该参数需要实现的函数
 trait Parameters {
     const KEY_TYPE: KeyType;
     const PUBLIC_KEY_LENGTH: usize;
@@ -105,7 +109,11 @@ trait Parameters {
 }
 
 /// Acts as a bridge between the static [Parameters] trait and the dynamic [KeyType] enum.
+//由于 Rust 的 trait object 要求 trait 是 对象安全（object-safe）的，
+//而原始 Parameters trait 包含关联常量（const），不是对象安全的，
+//所以需要一个“代理 trait”
 trait DynParameters {
+    // ... 所有 const 改为 fn
     fn public_key_length(&self) -> usize;
     fn secret_key_length(&self) -> usize;
     fn ciphertext_length(&self) -> usize;
@@ -124,6 +132,8 @@ trait DynParameters {
     ) -> Result<SharedSecret>;
 }
 
+
+// 为所有实现 Parameters 的类型自动实现 DynParameters
 impl<T: Parameters> DynParameters for T {
     fn public_key_length(&self) -> usize {
         Self::PUBLIC_KEY_LENGTH

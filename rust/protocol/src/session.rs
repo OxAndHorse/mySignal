@@ -181,7 +181,7 @@ pub async fn process_prekey_bundle<R: Rng + CryptoRng>(
     use_pq_ratchet: ratchet::UsePQRatchet,
 ) -> Result<()> {
     let their_identity_key = bundle.identity_key()?;
-
+    //第一次的时候会返回true，否则判断address和identity是否相等
     if !identity_store
         .is_trusted_identity(remote_address, their_identity_key, Direction::Sending)
         .await?
@@ -190,14 +190,14 @@ pub async fn process_prekey_bundle<R: Rng + CryptoRng>(
             remote_address.clone(),
         ));
     }
-
+    // 验证预公钥
     if !their_identity_key.public_key().verify_signature(
         &bundle.signed_pre_key_public()?.serialize(),
         bundle.signed_pre_key_signature()?,
     ) {
         return Err(SignalProtocolError::SignatureValidationFailed);
     }
-
+    // 验证pq密钥
     if !their_identity_key.public_key().verify_signature(
         &bundle.kyber_pre_key_public()?.serialize(),
         bundle.kyber_pre_key_signature()?,

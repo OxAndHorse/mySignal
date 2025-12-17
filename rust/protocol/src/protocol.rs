@@ -58,6 +58,7 @@ impl CiphertextMessage {
     }
 }
 
+//顶层封装，对应wire.proto
 #[derive(Debug, Clone)]
 pub struct SignalMessage {
     message_version: u8,
@@ -96,8 +97,16 @@ impl SignalMessage {
                 Some(pq_ratchet.to_vec())
             },
         };
-        let mut serialized = Vec::with_capacity(1 + message.encoded_len() + Self::MAC_LENGTH);
+        let mut serialized = Vec::with_capacity(1 + message.encoded_len() + Self::MAC_LENGTH);//序列化缓冲区预分配（性能优化）encode_len返回消息序列化后的字节长度
+        //高 4 位 = 应用层版本（如 Whisper 2/3/4）
+        // 低 4 位 = 消息类型版本（此处固定为 CIPHERTEXT_MESSAGE_CURRENT_VERSION = 4）
+        // → 这是 Signal 的双版本机制，用于区分：
+        // 消息语义版本（message_version）
+        // 序列化格式版本（CURRENT_VERSION）
+
         serialized.push(((message_version & 0xF) << 4) | CIPHERTEXT_MESSAGE_CURRENT_VERSION);
+
+        //Protobuf 的 encode() 方法不返回新数据，而是将序列化结果“追加写入”到一个可变的字节缓冲区（&mut Vec<u8>）中
         message
             .encode(&mut serialized)
             .expect("can always append to a buffer");
@@ -107,8 +116,8 @@ impl SignalMessage {
             mac_key,
             &serialized,
         )?;
-        serialized.extend_from_slice(&mac);
-        let serialized = serialized.into_boxed_slice();
+        serialized.extend_from_slice(&mac);//追加mac
+        let serialized = serialized.into_boxed_slice();//装箱，固定长度
         Ok(Self {
             message_version,
             sender_ratchet_key,
@@ -116,7 +125,7 @@ impl SignalMessage {
             previous_counter,
             ciphertext: ciphertext.into(),
             pq_ratchet: pq_ratchet.to_vec(),
-            serialized,
+            serialized,//主消息，上面的为sessionstate
         })
     }
 
@@ -206,10 +215,14 @@ impl TryFrom<&[u8]> for SignalMessage {
     type Error = SignalProtocolError;
 
     fn try_from(value: &[u8]) -> Result<Self> {
+        //SignalMessage::MAC_LENGTH = 8
+        // → 固定 MAC 长度（HMAC-SHA256 截断为 8 字节）
+        // 最小合法长度 = 1 (header) + 8 (MAC) = 9 字节
         if value.len() < SignalMessage::MAC_LENGTH + 1 {
             return Err(SignalProtocolError::CiphertextMessageTooShort(value.len()));
         }
-        let message_version = value[0] >> 4;
+        let message_version = value[0] >> 4;//高四位
+        //版本校验
         if message_version < CIPHERTEXT_MESSAGE_PRE_KYBER_VERSION {
             return Err(SignalProtocolError::LegacyCiphertextVersion(
                 message_version,
@@ -220,7 +233,7 @@ impl TryFrom<&[u8]> for SignalMessage {
                 message_version,
             ));
         }
-
+        //将消息体解码，反序列化
         let proto_structure =
             proto::wire::SignalMessage::decode(&value[1..value.len() - SignalMessage::MAC_LENGTH])
                 .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
@@ -229,6 +242,7 @@ impl TryFrom<&[u8]> for SignalMessage {
             .ratchet_key
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
         let sender_ratchet_key = PublicKey::deserialize(&sender_ratchet_key)?;
+        //消息序号，用于防重放
         let counter = proto_structure
             .counter
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
@@ -450,6 +464,8 @@ impl TryFrom<&[u8]> for PreKeySignalMessage {
     }
 }
 
+
+//用于群消息
 #[derive(Debug, Clone)]
 pub struct SenderKeyMessage {
     message_version: u8,

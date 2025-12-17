@@ -89,14 +89,14 @@ fn test_basic_prekey() -> TestResult {
                 ProtocolAddress::new("+14151111111".to_owned(), DeviceId::new(1).unwrap());
             let bob_address = ProtocolAddress::new("+14151111112".to_owned(), bob_device_id);
 
-            let mut bob_store_builder = TestStoreBuilder::new();
-            bob_add_keys(&mut bob_store_builder);
+            let mut bob_store_builder = TestStoreBuilder::new();//初始化会话store
+            bob_add_keys(&mut bob_store_builder);// 执行闭包，配置构建器
 
             let mut alice_store_builder = TestStoreBuilder::new();
             let alice_store = &mut alice_store_builder.store;
-
+            //构建预密钥包
             let bob_pre_key_bundle = bob_store_builder.make_bundle_with_latest_keys(bob_device_id);
-
+            //握手协商初始密钥
             process_prekey_bundle(
                 &bob_address,
                 &mut alice_store.session_store,
@@ -107,15 +107,16 @@ fn test_basic_prekey() -> TestResult {
                 alice_pqr,
             )
             .await?;
-
+            // 断言 1：会话已创建
             assert!(alice_store.load_session(&bob_address).await?.is_some());
+            // 断言 2：会话版本等于 expected_session_version
             assert_eq!(
                 alice_store.session_version(&bob_address)?,
                 expected_session_version
             );
 
             let original_message = "L'homme est condamné à être libre";
-
+            // Alice → Bob：发送并解密第一条消息（PreKey 消息）
             let outgoing_message = encrypt(alice_store, &bob_address, original_message).await?;
 
             assert_eq!(
@@ -180,7 +181,7 @@ fn test_basic_prekey() -> TestResult {
                 bob_pqr,
             )
             .await?;
-
+            //身份变更报错测试
             let mut alter_alice_store = TestStoreBuilder::new().store;
 
             bob_add_keys(&mut bob_store_builder);

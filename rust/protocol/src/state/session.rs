@@ -397,12 +397,15 @@ impl SessionState {
 
         Ok(None)
     }
-
+    /*将一个新生成的 MessageKeyGenerator 缓存到对应接收链（receiver chain）的消息密钥列表中
+    ，用于后续可能的乱序消息解密。
+     */
     pub(crate) fn set_message_keys(
         &mut self,
         sender: &PublicKey,
         message_keys: MessageKeyGenerator,
     ) -> Result<(), InvalidSessionError> {
+        // 根据发送者的临时公钥找到对应的接收链
         let chain_and_index = self
             .get_receiver_chain(sender)?
             .expect("called set_message_keys for a non-existent chain");

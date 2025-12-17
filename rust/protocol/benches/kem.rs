@@ -12,7 +12,7 @@ use rand::TryRngCore as _;
 fn bench_kem(c: &mut Criterion) {
     for key_type in [KeyType::Kyber768, KeyType::Kyber1024] {
         let mut rng = OsRng.unwrap_err();
-
+        
         c.bench_function(format!("{key_type:?}_generate").as_str(), |b| {
             b.iter(|| {
                 black_box(KeyPair::generate(key_type, &mut rng));

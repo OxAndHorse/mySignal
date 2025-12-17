@@ -270,7 +270,11 @@ impl PrivateKey {
             }
         }
     }
-
+    /*
+    curve25519::PrivateKey::from(priv_key)：将本地私钥的原始数据（priv_key，通常是 [u8; 32]）转换为 Curve25519 库的私钥类型；
+    private_key.calculate_agreement(&pub_key)：调用 Curve25519 算法的核心方法，计算本地私钥与对方公钥的共享密钥（结果是固定长度的字节数组，如 [u8; 32]）；
+    Box::new(...)：将固定长度的共享密钥数组转为 Box<[u8]>（装箱切片），符合返回值类型要求
+     */
     pub fn calculate_agreement(&self, their_key: &PublicKey) -> Result<Box<[u8]>, CurveError> {
         match (self.key, their_key.key) {
             (PrivateKeyData::DjbPrivateKey(priv_key), PublicKeyData::DjbPublicKey(pub_key)) => {
