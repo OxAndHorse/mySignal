@@ -101,8 +101,12 @@ pub enum SignalProtocolError {
     WrongKEMKeyType(u8, u8),
     /// bad KEM key length <{1}> for key with type <{0}>
     BadKEMKeyLength(kem::KeyType, usize),
+    /// bad TKEM key length <{1}> for key with type <{0}>
+    BadTagKEMKeyLength(kem::TagKeyType, usize),
     /// bad KEM ciphertext length <{1}> for key with type <{0}>
     BadKEMCiphertextLength(kem::KeyType, usize),
+    /// bad TKEM ciphertext length <{1}> for key with type <{0}>
+    BadTagKEMCiphertextLength(kem::TagKeyType, usize),
 }
 
 impl SignalProtocolError {

@@ -145,6 +145,7 @@ jni = "0.21"
 json5 = "0.4.1"
 libc = "0.2.168"
 libcrux-ml-kem = { version = "0.0.2", default-features = false }
+libcrux-ml-tkem = { version = "0.0.3"}
 linkme = "0.3.33"
 log = "0.4.21"
 log-panics = "2.1.0"

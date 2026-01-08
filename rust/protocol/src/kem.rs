@@ -57,6 +57,7 @@
 mod kyber1024;
 #[cfg(any(feature = "kyber768", test))]
 mod kyber768;
+mod tkyber1024;
 #[cfg(feature = "mlkem1024")]
 mod mlkem1024;
 
@@ -106,6 +107,28 @@ trait Parameters {
         secret_key: &KeyMaterial<Secret>,
         ciphertext: &[u8],
     ) -> std::result::Result<SharedSecret, DecapsulateError>;
+   
+}
+
+trait TagParameters{
+    const KEY_TYPE: TagKeyType;
+    const PUBLIC_KEY_LENGTH: usize;
+    const SECRET_KEY_LENGTH: usize;
+    const CIPHERTEXT_LENGTH: usize;
+    const SHARED_SECRET_LENGTH: usize;
+    fn generate<R: CryptoRng + ?Sized>(
+        csprng: &mut R,
+    ) -> (KeyMaterial<Public>, KeyMaterial<Secret>);
+    fn encapsulate_with_tag<R: CryptoRng + ?Sized>(
+        pub_key: &KeyMaterial<Public>,
+        csprng: &mut R,
+        tag:&[u8],
+    ) -> std::result::Result<(SharedSecret, RawCiphertext), BadKEMKeyLength>;
+    fn decapsulate_with_tag(
+        secret_key: &KeyMaterial<Secret>,
+        ciphertext: &[u8],
+        tag:&[u8],
+    ) -> std::result::Result<SharedSecret, DecapsulateError>;
 }
 
 /// Acts as a bridge between the static [Parameters] trait and the dynamic [KeyType] enum.
@@ -132,6 +155,28 @@ trait DynParameters {
     ) -> Result<SharedSecret>;
 }
 
+
+trait DynTagParameters {
+    // ... 所有 const 改为 fn
+    fn public_key_length(&self) -> usize;
+    fn secret_key_length(&self) -> usize;
+    fn ciphertext_length(&self) -> usize;
+    #[cfg_attr(not(test), expect(dead_code))]
+    fn shared_secret_length(&self) -> usize;
+    fn generate(&self, rng: &mut dyn CryptoRng) -> (KeyMaterial<Public>, KeyMaterial<Secret>);
+    fn encapsulate_with_tag(
+        &self,
+        pub_key: &KeyMaterial<Public>,
+        csprng: &mut dyn CryptoRng,
+        tag:&[u8],
+    ) -> Result<(SharedSecret, RawCiphertext)>;
+    fn decapsulate_with_tag(
+        &self,
+        secret_key: &KeyMaterial<Secret>,
+        ciphertext: &[u8],
+        tag:&[u8],
+    ) -> Result<SharedSecret>;
+}
 
 // 为所有实现 Parameters 的类型自动实现 DynParameters
 impl<T: Parameters> DynParameters for T {
@@ -181,6 +226,57 @@ impl<T: Parameters> DynParameters for T {
     }
 }
 
+impl<T: TagParameters> DynTagParameters for T {
+    fn public_key_length(&self) -> usize {
+        Self::PUBLIC_KEY_LENGTH
+    }
+
+    fn secret_key_length(&self) -> usize {
+        Self::SECRET_KEY_LENGTH
+    }
+
+    fn ciphertext_length(&self) -> usize {
+        Self::CIPHERTEXT_LENGTH
+    }
+
+    fn shared_secret_length(&self) -> usize {
+        Self::SHARED_SECRET_LENGTH
+    }
+
+    fn generate(&self, csprng: &mut dyn CryptoRng) -> (KeyMaterial<Public>, KeyMaterial<Secret>) {
+        Self::generate(csprng)
+    }
+
+    fn encapsulate_with_tag(
+            &self,
+            pub_key: &KeyMaterial<Public>,
+            csprng: &mut dyn CryptoRng,
+            tag:&[u8],
+        ) -> Result<(SharedSecret, RawCiphertext)> {
+        Self::encapsulate_with_tag(pub_key, csprng, tag).map_err(|BadKEMKeyLength| {
+            SignalProtocolError::BadTagKEMKeyLength(T::KEY_TYPE, pub_key.len())
+        })
+    }
+
+    fn decapsulate_with_tag(
+            &self,
+            secret_key: &KeyMaterial<Secret>,
+            ciphertext: &[u8],
+            tag:&[u8],
+        ) -> Result<SharedSecret> {
+        Self::decapsulate_with_tag(secret_key, ciphertext, tag).map_err(|e| match e {
+            DecapsulateError::BadKeyLength => {
+                SignalProtocolError::BadTagKEMKeyLength(T::KEY_TYPE, secret_key.len())
+            }
+            DecapsulateError::BadCiphertext => {
+                SignalProtocolError::BadTagKEMCiphertextLength(T::KEY_TYPE, ciphertext.len())
+            }
+        })
+    } 
+ }
+
+
+
 /// Helper trait for extracting the size of [`libcrux_ml_kem`]'s generic types.
 trait ConstantLength {
     const LENGTH: usize;
@@ -193,6 +289,15 @@ impl<const N: usize> ConstantLength for libcrux_ml_kem::MlKemPublicKey<N> {
     const LENGTH: usize = N;
 }
 impl<const N: usize> ConstantLength for libcrux_ml_kem::MlKemCiphertext<N> {
+    const LENGTH: usize = N;
+}
+impl<const N: usize> ConstantLength for libcrux_ml_tkem::MlKemPrivateKey<N> {
+    const LENGTH: usize = N;
+}
+impl<const N: usize> ConstantLength for libcrux_ml_tkem::MlKemPublicKey<N> {
+    const LENGTH: usize = N;
+}
+impl<const N: usize> ConstantLength for libcrux_ml_tkem::MlKemCiphertext<N> {
     const LENGTH: usize = N;
 }
 
@@ -218,11 +323,36 @@ pub enum KeyType {
     MLKEM1024,
 }
 
+#[derive(Display, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum TagKeyType {
+    
+    /// TKyber1024 key
+    TKyber1024,
+    /// ML-TKEM 1024 key
+    #[cfg(feature = "tkem1024")]
+    TKEM1024,
+}
+
+impl TagKeyType {
+    fn value(&self) -> u8 {
+        match self {
+            TagKeyType::TKyber1024 => 0x0B, // 新增：分配唯一标识
+
+        }
+    }
+
+    const fn parameters(&self) -> &'static dyn DynTagParameters{
+        match self {
+            TagKeyType::TKyber1024 => &tkyber1024::TagParameters,
+        }
+    }
+}
+
 impl KeyType {
     fn value(&self) -> u8 {
         match self {
             #[cfg(any(feature = "kyber768", test))]
-            KeyType::Kyber768 => 0x07,
+            KeyType::Kyber768 => 0x07,      
             KeyType::Kyber1024 => 0x08,
             #[cfg(feature = "mlkem1024")]
             KeyType::MLKEM1024 => 0x0A,
@@ -235,7 +365,7 @@ impl KeyType {
     const fn parameters(&self) -> &'static dyn DynParameters {
         match self {
             #[cfg(any(feature = "kyber768", test))]
-            KeyType::Kyber768 => &kyber768::Parameters,
+            KeyType::Kyber768 => &kyber768::Parameters,         
             KeyType::Kyber1024 => &kyber1024::Parameters,
             #[cfg(feature = "mlkem1024")]
             KeyType::MLKEM1024 => &mlkem1024::Parameters,
@@ -258,8 +388,20 @@ impl TryFrom<u8> for KeyType {
     }
 }
 
+impl TryFrom<u8> for TagKeyType {
+    type Error = SignalProtocolError;
+    fn try_from(x: u8) -> Result<Self> {
+        match x {
+            0x0B => Ok(TagKeyType::TKyber1024),
+            t => Err(SignalProtocolError::BadKEMKeyType(t)),
+        }
+    }
+}
+
+
 pub trait KeyKind {
     fn key_length(key_type: KeyType) -> usize;
+    fn tagkey_length(key_type: TagKeyType) -> usize;
 }
 
 pub enum Public {}
@@ -268,12 +410,18 @@ impl KeyKind for Public {
     fn key_length(key_type: KeyType) -> usize {
         key_type.parameters().public_key_length()
     }
+    fn tagkey_length(key_type: TagKeyType) -> usize {
+        key_type.parameters().public_key_length()
+    }
 }
 
 pub enum Secret {}
 
 impl KeyKind for Secret {
     fn key_length(key_type: KeyType) -> usize {
+        key_type.parameters().secret_key_length()
+    }
+    fn tagkey_length(key_type: TagKeyType) -> usize {
         key_type.parameters().secret_key_length()
     }
 }
@@ -307,11 +455,60 @@ impl<const SIZE: usize> From<libcrux_ml_kem::MlKemPrivateKey<SIZE>> for KeyMater
     }
 }
 
+impl<const SIZE: usize> From<libcrux_ml_tkem::MlKemPublicKey<SIZE>> for KeyMaterial<Public> {
+    fn from(value: libcrux_ml_tkem::MlKemPublicKey<SIZE>) -> Self {
+        KeyMaterial::new(value.as_ref().into())
+    }
+}
+
+impl<const SIZE: usize> From<libcrux_ml_tkem::MlKemPrivateKey<SIZE>> for KeyMaterial<Secret> {
+    fn from(value: libcrux_ml_tkem::MlKemPrivateKey<SIZE>) -> Self {
+        KeyMaterial::new(value.as_ref().into())
+    }
+}
+
 #[derive_where(Clone)]
 pub struct Key<T: KeyKind> {
     key_type: KeyType,
     key_data: KeyMaterial<T>,
 }
+#[derive_where(Clone)]
+pub struct TagKey<T: KeyKind> {
+    tagkey_type: TagKeyType,
+    key_data: KeyMaterial<T>,
+}
+
+
+impl<T: KeyKind> TagKey<T> {
+    /// Create a `Key<Kind>` instance from a byte string created with the
+    /// function `Key<Kind>::serialize(&self)`.
+    pub fn deserialize(value: &[u8]) -> Result<Self> {
+        if value.is_empty() {
+            return Err(SignalProtocolError::NoKeyTypeIdentifier);
+        }
+        let tagkey_type = TagKeyType::try_from(value[0])?;
+        if value.len() != T::tagkey_length(tagkey_type) + 1 {
+            return Err(SignalProtocolError::BadTagKEMKeyLength(tagkey_type, value.len()));
+        }
+        Ok(TagKey {
+            tagkey_type,
+            key_data: KeyMaterial::new(value[1..].into()),
+        })
+    }
+    /// Create a binary representation of the key that includes a protocol identifier.
+    pub fn serialize(&self) -> Box<[u8]> {
+        let mut result = Vec::with_capacity(1 + self.key_data.len());
+        result.push(self.tagkey_type.value());
+        result.extend_from_slice(&self.key_data);
+        result.into_boxed_slice()
+    }
+
+    /// Return the `KeyType` that identifies the KEM protocol for this key.
+    pub fn key_type(&self) -> TagKeyType {
+        self.tagkey_type
+    }
+}
+
 
 impl<T: KeyKind> Key<T> {
     /// Create a `Key<Kind>` instance from a byte string created with the
@@ -366,6 +563,30 @@ impl Key<Public> {
     }
 }
 
+impl TagKey<Public> {
+    /// Create a `SharedSecret` and a `Ciphertext`. The `Ciphertext` can be safely sent to the
+    /// holder of the corresponding `SecretKey` who can then use it to `decapsulate` the same
+    /// `SharedSecret`.
+    pub fn encapsulate_with_tag<R: CryptoRng>(
+        &self,
+        csprng: &mut R,
+        tag:&[u8],
+    ) -> Result<(SharedSecret, SerializedCiphertext)> {
+        let (ss, ct) = self
+            .tagkey_type
+            .parameters()
+            .encapsulate_with_tag(&self.key_data, csprng, tag)?;
+        Ok((
+            ss,
+            TagCiphertext {
+                tagkey_type: self.tagkey_type,
+                data: &ct,
+            }
+            .serialize(),
+        ))
+    }
+}
+
 impl Key<Secret> {
     /// Decapsulates a `SharedSecret` that was encapsulated into a `Ciphertext` by a holder of
     /// the corresponding `PublicKey`.
@@ -384,6 +605,25 @@ impl Key<Secret> {
     }
 }
 
+impl TagKey<Secret> {
+    /// Decapsulates a `SharedSecret` that was encapsulated into a `Ciphertext` by a holder of
+    /// the corresponding `PublicKey`.
+    pub fn decapsulate_with_tag(&self, ct_bytes: &SerializedCiphertext, tag:&[u8],) -> Result<Box<[u8]>> {
+        // deserialization checks that the length is correct for the KeyType
+        let ct = TagCiphertext::deserialize(ct_bytes)?;
+        if ct.tagkey_type != self.tagkey_type {
+            return Err(SignalProtocolError::WrongKEMKeyType(
+                ct.tagkey_type.value(),
+                self.tagkey_type.value(),
+            ));
+        }
+        self.tagkey_type
+            .parameters()
+            .decapsulate_with_tag(&self.key_data, ct.data, tag)
+    }
+}
+
+
 impl TryFrom<&[u8]> for Key<Public> {
     type Error = SignalProtocolError;
 
@@ -392,7 +632,23 @@ impl TryFrom<&[u8]> for Key<Public> {
     }
 }
 
+impl TryFrom<&[u8]> for TagKey<Public> {
+    type Error = SignalProtocolError;
+
+    fn try_from(value: &[u8]) -> Result<Self> {
+        Self::deserialize(value)
+    }
+}
+
 impl TryFrom<&[u8]> for Key<Secret> {
+    type Error = SignalProtocolError;
+
+    fn try_from(value: &[u8]) -> Result<Self> {
+        Self::deserialize(value)
+    }
+}
+
+impl TryFrom<&[u8]> for TagKey<Secret> {
     type Error = SignalProtocolError;
 
     fn try_from(value: &[u8]) -> Result<Self> {
@@ -413,7 +669,26 @@ impl subtle::ConstantTimeEq for Key<Public> {
     }
 }
 
+impl subtle::ConstantTimeEq for TagKey<Public> {
+    /// A constant-time comparison as long as the two keys have a matching type.
+    ///
+    /// If the two keys have different types, the comparison short-circuits,
+    /// much like comparing two slices of different lengths.
+    fn ct_eq(&self, other: &Self) -> subtle::Choice {
+        if self.tagkey_type != other.tagkey_type {
+            return 0.ct_eq(&1);
+        }
+        self.key_data.ct_eq(&other.key_data)
+    }
+}
+
 impl PartialEq for Key<Public> {
+    fn eq(&self, other: &Self) -> bool {
+        bool::from(self.ct_eq(other))
+    }
+}
+
+impl PartialEq for TagKey<Public> {
     fn eq(&self, other: &Self) -> bool {
         bool::from(self.ct_eq(other))
     }
@@ -421,17 +696,74 @@ impl PartialEq for Key<Public> {
 
 impl Eq for Key<Public> {}
 
+impl Eq for TagKey<Public> {}
 /// A KEM public key with the ability to encapsulate a shared secret.
 pub type PublicKey = Key<Public>;
 
+/// A TKEM public key with the ability to encapsulate a shared secret.
+pub type TagPublicKey = TagKey<Public>;
+
 /// A KEM secret key with the ability to decapsulate a shared secret.
 pub type SecretKey = Key<Secret>;
+
+/// A TKEM secret key with the ability to decapsulate a shared secret.
+pub type TagSecretKey = TagKey<Secret>;
 
 /// A public/secret key pair for a KEM protocol.
 #[derive(Clone)]
 pub struct KeyPair {
     pub public_key: PublicKey,
     pub secret_key: SecretKey,
+}
+
+/// A public/secret key pair for a TKEM protocol.
+#[derive(Clone)]
+pub struct TagKeyPair {
+    pub tagpublic_key: TagPublicKey,
+    pub tagsecret_key: TagSecretKey,
+}
+
+impl TagKeyPair {
+    /// Creates a public-secret key pair for a specified KEM protocol.
+    pub fn generate<R: Rng + CryptoRng>(tagkey_type: TagKeyType, csprng: &mut R) -> Self {
+        let (pk, sk) = tagkey_type.parameters().generate(csprng);
+        Self {
+            tagsecret_key: TagSecretKey {
+                tagkey_type,
+                key_data: sk,
+            },
+            tagpublic_key: TagPublicKey {
+                tagkey_type,
+                key_data: pk,
+            },
+        }
+    }
+
+    pub fn new(tagpublic_key: TagPublicKey, tagsecret_key: TagSecretKey) -> Self {
+        assert_eq!(tagpublic_key.tagkey_type, tagsecret_key.tagkey_type);
+        Self {
+            tagpublic_key,
+            tagsecret_key,
+        }
+    }
+
+    /// Deserialize public and secret keys that were serialized by `PublicKey::serialize()`
+    /// and `SecretKey::serialize()` respectively.
+    pub fn from_public_and_private(tagpublic_key: &[u8], tagsecret_key: &[u8]) -> Result<Self> {
+        let tagpublic_key = TagPublicKey::try_from(tagpublic_key)?;
+        let tagsecret_key = TagSecretKey::try_from(tagsecret_key)?;
+        if tagpublic_key.tagkey_type != tagsecret_key.tagkey_type {
+            Err(SignalProtocolError::WrongKEMKeyType(
+                tagsecret_key.tagkey_type.value(),
+                tagpublic_key.tagkey_type.value(),
+            ))
+        } else {
+            Ok(Self {
+                tagpublic_key,
+                tagsecret_key,
+            })
+        }
+    }
 }
 
 impl KeyPair {
@@ -483,6 +815,11 @@ struct Ciphertext<'a> {
     data: &'a [u8],
 }
 
+struct TagCiphertext<'a> {
+    tagkey_type: TagKeyType,
+    data: &'a [u8],
+}
+
 impl<'a> Ciphertext<'a> {
     /// Create a `Ciphertext` instance from a byte string created with the
     /// function `Ciphertext::serialize(&self)`.
@@ -507,6 +844,35 @@ impl<'a> Ciphertext<'a> {
     pub fn serialize(&self) -> SerializedCiphertext {
         let mut result = Vec::with_capacity(1 + self.data.len());
         result.push(self.key_type.value());
+        result.extend_from_slice(self.data);
+        result.into_boxed_slice()
+    }
+}
+
+impl<'a> TagCiphertext<'a> {
+    /// Create a `Ciphertext` instance from a byte string created with the
+    /// function `Ciphertext::serialize(&self)`.
+    pub fn deserialize(value: &'a [u8]) -> Result<Self> {
+        if value.is_empty() {
+            return Err(SignalProtocolError::NoKeyTypeIdentifier);
+        }
+        let tagkey_type = TagKeyType::try_from(value[0])?;
+        if value.len() != tagkey_type.parameters().ciphertext_length() + 1 {
+            return Err(SignalProtocolError::BadTagKEMCiphertextLength(
+                tagkey_type,
+                value.len(),
+            ));
+        }
+        Ok(TagCiphertext {
+            tagkey_type,
+            data: &value[1..],
+        })
+    }
+
+    /// Create a binary representation of the key that includes a protocol identifier.
+    pub fn serialize(&self) -> SerializedCiphertext {
+        let mut result = Vec::with_capacity(1 + self.data.len());
+        result.push(self.tagkey_type.value());
         result.extend_from_slice(self.data);
         result.into_boxed_slice()
     }
@@ -573,6 +939,33 @@ mod tests {
         assert_eq!(pubkey.key_type, KeyType::Kyber1024);
         let (ss_for_sender, ct) = pubkey.encapsulate(&mut rng).expect("encapsulation works");
         let ss_for_recipient = secretkey.decapsulate(&ct).expect("decapsulation works");
+
+        assert_eq!(ss_for_sender, ss_for_recipient);
+    }
+
+    #[test]
+    fn test_tagkyber1024_kem() {
+        // test data for tkyber1024
+        let pk_bytes = include_bytes!("kem/test-data/pk.dat");
+        let sk_bytes = include_bytes!("kem/test-data/sk.dat");
+        let tag  = b"This is a test tag for TKEM.";
+        let mut rng = rand::rngs::OsRng.unwrap_err();
+
+        let mut serialized_pk = Vec::with_capacity(1 + tkyber1024::TagParameters::PUBLIC_KEY_LENGTH);
+        serialized_pk.push(TagKeyType::TKyber1024.value());
+        serialized_pk.extend_from_slice(pk_bytes);
+
+        let mut serialized_sk = Vec::with_capacity(1 + tkyber1024::TagParameters::SECRET_KEY_LENGTH);
+        serialized_sk.push(TagKeyType::TKyber1024.value());
+        serialized_sk.extend_from_slice(sk_bytes);
+
+        let pubkey = TagPublicKey::deserialize(serialized_pk.as_slice()).expect("deserialize pubkey");
+        let secretkey =
+            TagSecretKey::deserialize(serialized_sk.as_slice()).expect("deserialize secretkey");
+
+        assert_eq!(pubkey.tagkey_type, TagKeyType::TKyber1024);
+        let (ss_for_sender, ct) = pubkey.encapsulate_with_tag(&mut rng,tag).expect("encapsulation works");
+        let ss_for_recipient = secretkey.decapsulate_with_tag(&ct,tag).expect("decapsulation works");
 
         assert_eq!(ss_for_sender, ss_for_recipient);
     }

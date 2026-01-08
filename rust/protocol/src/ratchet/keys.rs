@@ -11,8 +11,8 @@ use crate::proto::storage::session_structure;
 use crate::{crypto, PrivateKey, PublicKey, Result};
 
 pub(crate) enum MessageKeyGenerator {
-    Keys(MessageKeys),
-    Seed((Vec<u8>, u32)),
+    Keys(MessageKeys),//cache key
+    Seed((Vec<u8>, u32)),//new key
 }
 
 impl MessageKeyGenerator {

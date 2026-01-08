@@ -32,6 +32,7 @@ hmac = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 libcrux-ml-kem = { workspace = true, features = ["kyber", "mlkem1024"] }
+libcrux-ml-tkem = { workspace = true, features = ["kyber", "mlkem1024","tkem1024"] }
 log = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
@@ -50,6 +51,7 @@ kyber768 = ["libcrux-ml-kem/kyber", "libcrux-ml-kem/mlkem768"]
 # incompatibly until the final version of the standard is published and
 # libsignal will update to match.
 mlkem1024 = []
+tkem1024 = []
 
 [dev-dependencies]
 clap = { workspace = true, features = ["derive"] }
