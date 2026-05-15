@@ -77,3 +77,75 @@ fn test_alice_and_bob_agree_on_chain_keys_with_kyber() -> Result<(), SignalProto
 
     Ok(())
 }
+
+#[cfg(feature = "tkem1024")]
+#[test]
+fn test_alice_and_bob_agree_on_chain_keys_with_tkem() -> Result<(), SignalProtocolError> {
+    let mut csprng = rand::rngs::OsRng.unwrap_err();
+
+    let alice_identity_key_pair = IdentityKeyPair::generate(&mut csprng);
+    let alice_base_key_pair = KeyPair::generate(&mut csprng);
+
+    let bob_ephemeral_key_pair = KeyPair::generate(&mut csprng);
+    let bob_identity_key_pair = IdentityKeyPair::generate(&mut csprng);
+    let bob_signed_pre_key_pair = KeyPair::generate(&mut csprng);
+    let bob_tkem_key_pair = kem::TagKeyPair::generate(kem::TagKeyType::TKEM1024, &mut csprng);
+
+    let alice_parameters = AliceSignalProtocolParameters::new_with_tkem(
+        alice_identity_key_pair,
+        alice_base_key_pair,
+        *bob_identity_key_pair.identity_key(),
+        bob_signed_pre_key_pair.public_key,
+        bob_ephemeral_key_pair.public_key,
+        bob_tkem_key_pair.tagpublic_key.clone(),
+        UsePQRatchet::No,
+    );
+
+    let alice_record = initialize_alice_session_record_tkem(&alice_parameters, &mut csprng)?;
+
+    assert_eq!(
+        KYBER_AWARE_MESSAGE_VERSION,
+        alice_record.session_version().expect("must have a version")
+    );
+
+    let tkem_ciphertext = alice_record
+        .get_tkem_ciphertext()?
+        .expect("must have tkem ciphertext")
+        .clone();
+    let tkem_tag = alice_record
+        .get_tkem_tag()?
+        .expect("must have tkem tag")
+        .clone();
+
+    let bob_parameters = BobSignalProtocolParameters::new_with_tkem(
+        bob_identity_key_pair,
+        bob_signed_pre_key_pair,
+        None,
+        bob_ephemeral_key_pair,
+        bob_tkem_key_pair,
+        *alice_identity_key_pair.identity_key(),
+        alice_base_key_pair.public_key,
+        &tkem_ciphertext,
+        &tkem_tag,
+        UsePQRatchet::No,
+    );
+    let bob_record = initialize_bob_session_record_tkem(&bob_parameters)?;
+
+    assert_eq!(
+        KYBER_AWARE_MESSAGE_VERSION,
+        bob_record.session_version().expect("must have a version")
+    );
+
+    assert_eq!(
+        bob_record
+            .get_sender_chain_key_bytes()
+            .expect("bob should have chain key"),
+        alice_record
+            .get_receiver_chain_key_bytes(&bob_ephemeral_key_pair.public_key)
+            .expect("alice should have chain key")
+            .expect("has chain key")
+            .to_vec()
+    );
+
+    Ok(())
+}

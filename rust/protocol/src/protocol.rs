@@ -68,6 +68,10 @@ pub struct SignalMessage {
     previous_counter: u32,
     ciphertext: Box<[u8]>,
     pq_ratchet: spqr::SerializedState,
+    #[cfg(feature = "tkem1024")]
+    tkem_ciphertext: Option<Vec<u8>>,
+    #[cfg(feature = "tkem1024")]
+    tag: Option<Vec<u8>>,
     serialized: Box<[u8]>,
 }
 
@@ -96,6 +100,8 @@ impl SignalMessage {
             } else {
                 Some(pq_ratchet.to_vec())
             },
+            tkem_ciphertext: None,
+            tag: None,
         };
         let mut serialized = Vec::with_capacity(1 + message.encoded_len() + Self::MAC_LENGTH);//序列化缓冲区预分配（性能优化）encode_len返回消息序列化后的字节长度
         //高 4 位 = 应用层版本（如 Whisper 2/3/4）
@@ -125,7 +131,64 @@ impl SignalMessage {
             previous_counter,
             ciphertext: ciphertext.into(),
             pq_ratchet: pq_ratchet.to_vec(),
+            #[cfg(feature = "tkem1024")]
+            tkem_ciphertext: None,
+            #[cfg(feature = "tkem1024")]
+            tag: None,
             serialized,//主消息，上面的为sessionstate
+        })
+    }
+
+    #[cfg(feature = "tkem1024")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_tkem(
+        message_version: u8,
+        mac_key: &[u8],
+        sender_ratchet_key: PublicKey,
+        counter: u32,
+        previous_counter: u32,
+        ciphertext: &[u8],
+        sender_identity_key: &IdentityKey,
+        receiver_identity_key: &IdentityKey,
+        pq_ratchet: &[u8],
+        tkem_ciphertext: Option<&[u8]>,
+        tag: Option<&[u8]>,
+    ) -> Result<Self> {
+        let message = proto::wire::SignalMessage {
+            ratchet_key: Some(sender_ratchet_key.serialize().into_vec()),
+            counter: Some(counter),
+            previous_counter: Some(previous_counter),
+            ciphertext: Some(Vec::<u8>::from(ciphertext)),
+            pq_ratchet: if pq_ratchet.is_empty() {
+                None
+            } else {
+                Some(pq_ratchet.to_vec())
+            },
+            tkem_ciphertext: tkem_ciphertext.map(|v| v.to_vec()),
+            tag: tag.map(|v| v.to_vec()),
+        };
+        let mut serialized = Vec::with_capacity(1 + message.encoded_len() + Self::MAC_LENGTH);
+        serialized.push(((message_version & 0xF) << 4) | CIPHERTEXT_MESSAGE_CURRENT_VERSION);
+        message
+            .encode(&mut serialized)
+            .expect("can always append to a buffer");
+        let mac = Self::compute_mac(
+            sender_identity_key,
+            receiver_identity_key,
+            mac_key,
+            &serialized,
+        )?;
+        serialized.extend_from_slice(&mac);
+        Ok(Self {
+            message_version,
+            sender_ratchet_key,
+            counter,
+            previous_counter,
+            ciphertext: ciphertext.into(),
+            pq_ratchet: pq_ratchet.to_vec(),
+            tkem_ciphertext: tkem_ciphertext.map(|v| v.to_vec()),
+            tag: tag.map(|v| v.to_vec()),
+            serialized: serialized.into_boxed_slice(),
         })
     }
 
@@ -159,6 +222,18 @@ impl SignalMessage {
         &self.ciphertext
     }
 
+    #[inline]
+    #[cfg(feature = "tkem1024")]
+    pub fn tkem_ciphertext(&self) -> Option<&[u8]> {
+        self.tkem_ciphertext.as_deref()
+    }
+
+    #[inline]
+    #[cfg(feature = "tkem1024")]
+    pub fn tag(&self) -> Option<&[u8]> {
+        self.tag.as_deref()
+    }
+
     pub fn verify_mac(
         &self,
         sender_identity_key: &IdentityKey,
@@ -172,7 +247,9 @@ impl SignalMessage {
             &self.serialized[..self.serialized.len() - Self::MAC_LENGTH],
         )?;
         let their_mac = &self.serialized[self.serialized.len() - Self::MAC_LENGTH..];
-        let result: bool = our_mac.ct_eq(their_mac).into();
+        let their_mac_array: &[u8; Self::MAC_LENGTH] = their_mac.try_into()
+            .map_err(|_| SignalProtocolError::InvalidMacKeyLength(their_mac.len()))?;
+        let result: bool = our_mac.ct_eq(their_mac_array).into();
         if !result {
             // A warning instead of an error because we try multiple sessions.
             log::warn!(
@@ -259,6 +336,10 @@ impl TryFrom<&[u8]> for SignalMessage {
             previous_counter,
             ciphertext,
             pq_ratchet: proto_structure.pq_ratchet.unwrap_or(vec![]),
+            #[cfg(feature = "tkem1024")]
+            tkem_ciphertext: proto_structure.tkem_ciphertext,
+            #[cfg(feature = "tkem1024")]
+            tag: proto_structure.tag,
             serialized: Box::from(value),
         })
     }
@@ -429,6 +510,7 @@ impl TryFrom<&[u8]> for PreKeySignalMessage {
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
 
         let base_key = PublicKey::deserialize(base_key.as_ref())?;
+        let message = SignalMessage::try_from(message.as_ref())?;
 
         let kyber_payload = match (
             proto_structure.kyber_pre_key_id,
@@ -436,6 +518,8 @@ impl TryFrom<&[u8]> for PreKeySignalMessage {
         ) {
             (Some(id), Some(ct)) => Some(KyberPayload::new(id.into(), ct.into_boxed_slice())),
             (None, None) if message_version <= CIPHERTEXT_MESSAGE_PRE_KYBER_VERSION => None,
+            #[cfg(feature = "tkem1024")]
+            (None, None) if message.tkem_ciphertext().is_some() && message.tag().is_some() => None,
             (None, None) => {
                 return Err(SignalProtocolError::InvalidMessage(
                     CiphertextMessageType::PreKey,
@@ -458,7 +542,7 @@ impl TryFrom<&[u8]> for PreKeySignalMessage {
             kyber_payload,
             base_key,
             identity_key: IdentityKey::try_from(identity_key.as_ref())?,
-            message: SignalMessage::try_from(message.as_ref())?,
+            message,
             serialized: Box::from(value),
         })
     }

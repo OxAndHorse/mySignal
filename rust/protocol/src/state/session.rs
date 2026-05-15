@@ -123,6 +123,8 @@ impl SessionState {
                 local_registration_id: 0,
                 alice_base_key: alice_base_key.serialize().into_vec(),
                 pq_ratchet_state,
+                tkem_ciphertext: None,
+                tkem_tag: None,
             },
         }
     }
@@ -468,6 +470,26 @@ impl SessionState {
         self.session.pending_kyber_pre_key = Some(pending);
     }
 
+    #[cfg(feature = "tkem1024")]
+    pub(crate) fn set_tkem_ciphertext(&mut self, ciphertext: kem::SerializedCiphertext) {
+        self.session.tkem_ciphertext = Some(ciphertext.into_vec());
+    }
+
+    #[cfg(feature = "tkem1024")]
+    pub(crate) fn get_tkem_ciphertext(&self) -> Option<&Vec<u8>> {
+        self.session.tkem_ciphertext.as_ref()
+    }
+
+    #[cfg(feature = "tkem1024")]
+    pub(crate) fn set_tkem_tag(&mut self, tag: Vec<u8>) {
+        self.session.tkem_tag = Some(tag);
+    }
+
+    #[cfg(feature = "tkem1024")]
+    pub(crate) fn get_tkem_tag(&self) -> Option<&Vec<u8>> {
+        self.session.tkem_tag.as_ref()
+    }
+
     pub(crate) fn set_unacknowledged_kyber_pre_key_id(
         &mut self,
         signed_kyber_pre_key_id: KyberPreKeyId,
@@ -514,6 +536,7 @@ impl SessionState {
             local_registration_id: _local_registration_id,
             alice_base_key: _alice_base_key,
             pq_ratchet_state: _pq_ratchet_state,
+            ..
         } = &self.session;
         // ####### IMPORTANT #######
         // Don't forget to clean up new pending fields.
@@ -850,5 +873,31 @@ impl SessionRecord {
                 )
             })?
             .get_kyber_ciphertext())
+    }
+
+    #[cfg(feature = "tkem1024")]
+    pub fn get_tkem_ciphertext(&self) -> Result<Option<&Vec<u8>>, SignalProtocolError> {
+        Ok(self
+            .session_state()
+            .ok_or_else(|| {
+                SignalProtocolError::InvalidState(
+                    "get_tkem_ciphertext",
+                    "No current session".into(),
+                )
+            })?
+            .get_tkem_ciphertext())
+    }
+
+    #[cfg(feature = "tkem1024")]
+    pub fn get_tkem_tag(&self) -> Result<Option<&Vec<u8>>, SignalProtocolError> {
+        Ok(self
+            .session_state()
+            .ok_or_else(|| {
+                SignalProtocolError::InvalidState(
+                    "get_tkem_tag",
+                    "No current session".into(),
+                )
+            })?
+            .get_tkem_tag())
     }
 }

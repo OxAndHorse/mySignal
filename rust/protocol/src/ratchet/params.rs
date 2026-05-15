@@ -4,6 +4,8 @@
 //
 
 use crate::{kem, IdentityKey, IdentityKeyPair, KeyPair, PublicKey};
+#[cfg(feature = "tkem1024")]
+use rand::TryRngCore as _;
 
 #[derive(Clone, Copy)]
 pub enum UsePQRatchet {
@@ -31,6 +33,9 @@ pub struct AliceSignalProtocolParameters {
     their_ratchet_key: PublicKey,
     their_kyber_pre_key: kem::PublicKey,
 
+    #[cfg(feature = "tkem1024")]
+    their_tkem_master_key: Option<kem::TagPublicKey>,
+
     use_pq_ratchet: UsePQRatchet,
 }
 
@@ -52,6 +57,34 @@ impl AliceSignalProtocolParameters {
             their_one_time_pre_key: None,
             their_ratchet_key,
             their_kyber_pre_key,
+            #[cfg(feature = "tkem1024")]
+            their_tkem_master_key: None,
+            use_pq_ratchet,
+        }
+    }
+
+    #[cfg(feature = "tkem1024")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_tkem(
+        our_identity_key_pair: IdentityKeyPair,
+        our_base_key_pair: KeyPair,
+        their_identity_key: IdentityKey,
+        their_signed_pre_key: PublicKey,
+        their_ratchet_key: PublicKey,
+        their_tkem_master_key: kem::TagPublicKey,
+        use_pq_ratchet: UsePQRatchet,
+    ) -> Self {
+        let mut csprng = rand::rngs::OsRng.unwrap_err();
+        let dummy_kyber = kem::KeyPair::generate(kem::KeyType::Kyber1024, &mut csprng).public_key;
+        Self {
+            our_identity_key_pair,
+            our_base_key_pair,
+            their_identity_key,
+            their_signed_pre_key,
+            their_one_time_pre_key: None,
+            their_ratchet_key,
+            their_kyber_pre_key: dummy_kyber,
+            their_tkem_master_key: Some(their_tkem_master_key),
             use_pq_ratchet,
         }
     }
@@ -104,6 +137,12 @@ impl AliceSignalProtocolParameters {
     pub fn use_pq_ratchet(&self) -> UsePQRatchet {
         self.use_pq_ratchet
     }
+
+    #[inline]
+    #[cfg(feature = "tkem1024")]
+    pub fn their_tkem_master_key(&self) -> Option<&kem::TagPublicKey> {
+        self.their_tkem_master_key.as_ref()
+    }
 }
 
 pub struct BobSignalProtocolParameters<'a> {
@@ -115,7 +154,14 @@ pub struct BobSignalProtocolParameters<'a> {
 
     their_identity_key: IdentityKey,
     their_base_key: PublicKey,
-    their_kyber_ciphertext: &'a kem::SerializedCiphertext,
+    their_kyber_ciphertext: Option<&'a kem::SerializedCiphertext>,
+
+    #[cfg(feature = "tkem1024")]
+    our_tkem_key_pair: Option<kem::TagKeyPair>,
+    #[cfg(feature = "tkem1024")]
+    their_tkem_ciphertext: Option<&'a [u8]>,
+    #[cfg(feature = "tkem1024")]
+    their_tkem_tag: Option<&'a [u8]>,
 
     use_pq_ratchet: UsePQRatchet,
 }
@@ -141,7 +187,45 @@ impl<'a> BobSignalProtocolParameters<'a> {
             our_kyber_pre_key_pair,
             their_identity_key,
             their_base_key,
-            their_kyber_ciphertext,
+            their_kyber_ciphertext: Some(their_kyber_ciphertext),
+            #[cfg(feature = "tkem1024")]
+            our_tkem_key_pair: None,
+            #[cfg(feature = "tkem1024")]
+            their_tkem_ciphertext: None,
+            #[cfg(feature = "tkem1024")]
+            their_tkem_tag: None,
+            use_pq_ratchet,
+        }
+    }
+
+    #[cfg(feature = "tkem1024")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_tkem(
+        our_identity_key_pair: IdentityKeyPair,
+        our_signed_pre_key_pair: KeyPair,
+        our_one_time_pre_key_pair: Option<KeyPair>,
+        our_ratchet_key_pair: KeyPair,
+        our_tkem_key_pair: kem::TagKeyPair,
+        their_identity_key: IdentityKey,
+        their_base_key: PublicKey,
+        their_tkem_ciphertext: &'a [u8],
+        their_tkem_tag: &'a [u8],
+        use_pq_ratchet: UsePQRatchet,
+    ) -> Self {
+        let mut csprng = rand::rngs::OsRng.unwrap_err();
+        let dummy_kyber_key = kem::KeyPair::generate(kem::KeyType::Kyber1024, &mut csprng);
+        Self {
+            our_identity_key_pair,
+            our_signed_pre_key_pair,
+            our_one_time_pre_key_pair,
+            our_ratchet_key_pair,
+            our_kyber_pre_key_pair: dummy_kyber_key,
+            their_identity_key,
+            their_base_key,
+            their_kyber_ciphertext: None,
+            our_tkem_key_pair: Some(our_tkem_key_pair),
+            their_tkem_ciphertext: Some(their_tkem_ciphertext),
+            their_tkem_tag: Some(their_tkem_tag),
             use_pq_ratchet,
         }
     }
@@ -182,12 +266,30 @@ impl<'a> BobSignalProtocolParameters<'a> {
     }
 
     #[inline]
-    pub fn their_kyber_ciphertext(&self) -> &kem::SerializedCiphertext {
+    pub fn their_kyber_ciphertext(&self) -> Option<&kem::SerializedCiphertext> {
         self.their_kyber_ciphertext
     }
 
     #[inline]
     pub fn use_pq_ratchet(&self) -> UsePQRatchet {
         self.use_pq_ratchet
+    }
+
+    #[inline]
+    #[cfg(feature = "tkem1024")]
+    pub fn our_tkem_key_pair(&self) -> Option<&kem::TagKeyPair> {
+        self.our_tkem_key_pair.as_ref()
+    }
+
+    #[inline]
+    #[cfg(feature = "tkem1024")]
+    pub fn their_tkem_ciphertext(&self) -> Option<&'a [u8]> {
+        self.their_tkem_ciphertext
+    }
+
+    #[inline]
+    #[cfg(feature = "tkem1024")]
+    pub fn their_tkem_tag(&self) -> Option<&'a [u8]> {
+        self.their_tkem_tag
     }
 }

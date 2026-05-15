@@ -64,7 +64,9 @@ message SessionStructure {
   reserved 12; // no longer used
   bytes          alice_base_key            = 13;
   bytes          pq_ratchet_state          = 15;
-  // Next index: 16
+  optional bytes tkem_ciphertext           = 16;
+  optional bytes tkem_tag                  = 17;
+  // Next index: 18
 }
 
 message RecordStructure {

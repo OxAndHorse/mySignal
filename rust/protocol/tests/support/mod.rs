@@ -28,6 +28,16 @@ pub fn test_in_memory_protocol_store() -> Result<InMemSignalProtocolStore, Signa
     InMemSignalProtocolStore::new(identity_key, registration_id as u32)
 }
 
+#[cfg(feature = "tkem1024")]
+pub fn test_in_memory_protocol_store_tkem(
+) -> Result<InMemSignalProtocolStore, SignalProtocolError> {
+    let mut csprng = OsRng.unwrap_err();
+    let identity_key = IdentityKeyPair::generate(&mut csprng);
+    let registration_id: u8 = csprng.random();
+    let tkem_key_pair = kem::TagKeyPair::generate(kem::TagKeyType::TKEM1024, &mut csprng);
+    InMemSignalProtocolStore::new_with_tkem(identity_key, registration_id as u32, tkem_key_pair)
+}
+
 pub async fn encrypt(
     store: &mut InMemSignalProtocolStore,
     remote_address: &ProtocolAddress,
@@ -60,6 +70,53 @@ pub async fn decrypt(
         &mut store.pre_key_store,
         &store.signed_pre_key_store,
         &mut store.kyber_pre_key_store,
+        &mut csprng,
+        use_pq_ratchet,
+    )
+    .await
+}
+
+#[cfg(feature = "tkem1024")]
+pub async fn encrypt_tkem(
+    store: &mut InMemSignalProtocolStore,
+    remote_address: &ProtocolAddress,
+    msg: &str,
+) -> Result<CiphertextMessage, SignalProtocolError> {
+    let mut csprng = OsRng.unwrap_err();
+    let tkem_store = store.tkem_store.as_mut().ok_or_else(|| {
+        SignalProtocolError::InvalidState("encrypt_tkem", "No TKEM store configured".to_string())
+    })?;
+    message_encrypt_tkem(
+        msg.as_bytes(),
+        remote_address,
+        &mut store.session_store,
+        &mut store.identity_store,
+        tkem_store,
+        SystemTime::now(),
+        &mut csprng,
+    )
+    .await
+}
+
+#[cfg(feature = "tkem1024")]
+pub async fn decrypt_tkem(
+    store: &mut InMemSignalProtocolStore,
+    remote_address: &ProtocolAddress,
+    msg: &CiphertextMessage,
+    use_pq_ratchet: UsePQRatchet,
+) -> Result<Vec<u8>, SignalProtocolError> {
+    let mut csprng = OsRng.unwrap_err();
+    let tkem_store = store.tkem_store.as_mut().ok_or_else(|| {
+        SignalProtocolError::InvalidState("decrypt_tkem", "No TKEM store configured".to_string())
+    })?;
+    message_decrypt_tkem(
+        msg,
+        remote_address,
+        &mut store.session_store,
+        &mut store.identity_store,
+        &mut store.pre_key_store,
+        &store.signed_pre_key_store,
+        tkem_store,
         &mut csprng,
         use_pq_ratchet,
     )
@@ -138,6 +195,70 @@ pub async fn create_pre_key_bundle<R: Rng + CryptoRng>(
             ),
         )
         .await?;
+    Ok(pre_key_bundle)
+}
+
+#[cfg(feature = "tkem1024")]
+pub async fn create_pre_key_bundle_tkem<R: Rng + CryptoRng>(
+    store: &mut InMemSignalProtocolStore,
+    mut csprng: &mut R,
+) -> Result<PreKeyBundle, SignalProtocolError> {
+    let pre_key_pair = KeyPair::generate(&mut csprng);
+    let signed_pre_key_pair = KeyPair::generate(&mut csprng);
+    let tkem_key_pair = store.get_tkem_key_pair().await?;
+
+    let signed_pre_key_public = signed_pre_key_pair.public_key.serialize();
+    let signed_pre_key_signature = store
+        .get_identity_key_pair()
+        .await?
+        .private_key()
+        .calculate_signature(&signed_pre_key_public, &mut csprng)?;
+
+    let tkem_master_key_public = tkem_key_pair.tagpublic_key.serialize();
+    let tkem_master_key_signature = store
+        .get_identity_key_pair()
+        .await?
+        .private_key()
+        .calculate_signature(&tkem_master_key_public, &mut csprng)?;
+
+    let device_id: DeviceId = csprng.random();
+    let pre_key_id: u32 = csprng.random();
+    let signed_pre_key_id: u32 = csprng.random();
+    let tkem_master_key_id: u32 = csprng.random();
+
+    let pre_key_bundle = PreKeyBundle::new_with_tkem(
+        store.get_local_registration_id().await?,
+        device_id,
+        Some((pre_key_id.into(), pre_key_pair.public_key)),
+        signed_pre_key_id.into(),
+        signed_pre_key_pair.public_key,
+        signed_pre_key_signature.to_vec(),
+        tkem_master_key_id,
+        tkem_key_pair.tagpublic_key,
+        tkem_master_key_signature.to_vec(),
+        *store.get_identity_key_pair().await?.identity_key(),
+    )?;
+
+    store
+        .save_pre_key(
+            pre_key_id.into(),
+            &PreKeyRecord::new(pre_key_id.into(), &pre_key_pair),
+        )
+        .await?;
+
+    let timestamp = Timestamp::from_epoch_millis(csprng.random());
+    store
+        .save_signed_pre_key(
+            signed_pre_key_id.into(),
+            &SignedPreKeyRecord::new(
+                signed_pre_key_id.into(),
+                timestamp,
+                &signed_pre_key_pair,
+                &signed_pre_key_signature,
+            ),
+        )
+        .await?;
+
     Ok(pre_key_bundle)
 }
 

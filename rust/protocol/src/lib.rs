@@ -62,6 +62,8 @@ pub use ratchet::{
     initialize_alice_session_record, initialize_bob_session_record, AliceSignalProtocolParameters,
     BobSignalProtocolParameters, UsePQRatchet,
 };
+#[cfg(feature = "tkem1024")]
+pub use ratchet::{initialize_alice_session_record_tkem, initialize_bob_session_record_tkem};
 pub use sealed_sender::{
     sealed_sender_decrypt, sealed_sender_decrypt_to_usmc, sealed_sender_encrypt,
     sealed_sender_encrypt_from_usmc, sealed_sender_multi_recipient_encrypt, ContentHint,
@@ -70,8 +72,15 @@ pub use sealed_sender::{
 };
 pub use sender_keys::SenderKeyRecord;
 pub use session::{process_prekey, process_prekey_bundle};
+#[cfg(feature = "tkem1024")]
+pub use session::{process_prekey_bundle_tkem, process_prekey_tkem};
 pub use session_cipher::{
     message_decrypt, message_decrypt_prekey, message_decrypt_signal, message_encrypt,
+};
+#[cfg(feature = "tkem1024")]
+pub use session_cipher::{
+    message_decrypt_prekey_tkem, message_decrypt_signal_tkem, message_decrypt_tkem,
+    message_encrypt_tkem,
 };
 pub use state::{
     GenericSignedPreKey, KyberPreKeyId, KyberPreKeyRecord, PreKeyBundle, PreKeyBundleContent,
@@ -83,4 +92,6 @@ pub use storage::{
     InMemSignedPreKeyStore, KyberPreKeyStore, PreKeyStore, ProtocolStore, SenderKeyStore,
     SessionStore, SignedPreKeyStore,
 };
+#[cfg(feature = "tkem1024")]
+pub use storage::{InMemTkemStore, TkemStore};
 pub use timestamp::Timestamp;

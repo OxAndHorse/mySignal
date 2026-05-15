@@ -363,6 +363,8 @@ pub struct InMemSignalProtocolStore {
     pub kyber_pre_key_store: InMemKyberPreKeyStore,
     pub identity_store: InMemIdentityKeyStore,
     pub sender_key_store: InMemSenderKeyStore,
+    #[cfg(feature = "tkem1024")]
+    pub tkem_store: Option<InMemTkemStore>,
 }
 
 impl InMemSignalProtocolStore {
@@ -376,6 +378,26 @@ impl InMemSignalProtocolStore {
             kyber_pre_key_store: InMemKyberPreKeyStore::new(),
             identity_store: InMemIdentityKeyStore::new(key_pair, registration_id),
             sender_key_store: InMemSenderKeyStore::new(),
+            #[cfg(feature = "tkem1024")]
+            tkem_store: None,
+        })
+    }
+
+    /// Create an object with the minimal implementation of [traits::ProtocolStore], including TKEM
+    #[cfg(feature = "tkem1024")]
+    pub fn new_with_tkem(
+        key_pair: IdentityKeyPair,
+        registration_id: u32,
+        tkem_key_pair: crate::kem::TagKeyPair,
+    ) -> Result<Self> {
+        Ok(Self {
+            session_store: InMemSessionStore::new(),
+            pre_key_store: InMemPreKeyStore::new(),
+            signed_pre_key_store: InMemSignedPreKeyStore::new(),
+            kyber_pre_key_store: InMemKyberPreKeyStore::new(),
+            identity_store: InMemIdentityKeyStore::new(key_pair, registration_id),
+            sender_key_store: InMemSenderKeyStore::new(),
+            tkem_store: Some(InMemTkemStore::new(tkem_key_pair)),
         })
     }
 
@@ -526,3 +548,79 @@ impl traits::SenderKeyStore for InMemSignalProtocolStore {
 }
 
 impl traits::ProtocolStore for InMemSignalProtocolStore {}
+
+/// Reference implementation of [traits::TkemStore].
+#[cfg(feature = "tkem1024")]
+#[derive(Clone)]
+pub struct InMemTkemStore {
+    key_pair: crate::kem::TagKeyPair,
+    remote_keys: HashMap<ProtocolAddress, crate::kem::TagPublicKey>,
+}
+
+#[cfg(feature = "tkem1024")]
+impl InMemTkemStore {
+    /// Create a new TKEM store.
+    pub fn new(key_pair: crate::kem::TagKeyPair) -> Self {
+        Self {
+            key_pair,
+            remote_keys: HashMap::new(),
+        }
+    }
+}
+
+#[cfg(feature = "tkem1024")]
+#[async_trait(?Send)]
+impl traits::TkemStore for InMemTkemStore {
+    async fn get_tkem_key_pair(&self) -> Result<crate::kem::TagKeyPair> {
+        Ok(self.key_pair.clone())
+    }
+
+    async fn save_remote_tkem_public_key(
+        &mut self,
+        address: &ProtocolAddress,
+        public_key: &crate::kem::TagPublicKey,
+    ) -> Result<()> {
+        self.remote_keys.insert(address.clone(), public_key.clone());
+        Ok(())
+    }
+
+    async fn get_remote_tkem_public_key(
+        &self,
+        address: &ProtocolAddress,
+    ) -> Result<Option<crate::kem::TagPublicKey>> {
+        Ok(self.remote_keys.get(address).cloned())
+    }
+}
+
+#[cfg(feature = "tkem1024")]
+#[async_trait(?Send)]
+impl traits::TkemStore for InMemSignalProtocolStore {
+    async fn get_tkem_key_pair(&self) -> Result<crate::kem::TagKeyPair> {
+        self.tkem_store
+            .as_ref()
+            .ok_or_else(|| SignalProtocolError::InvalidState("ProtocolStore", "No TKEM store configured".into()))?
+            .get_tkem_key_pair()
+            .await
+    }
+
+    async fn save_remote_tkem_public_key(
+        &mut self,
+        address: &ProtocolAddress,
+        public_key: &crate::kem::TagPublicKey,
+    ) -> Result<()> {
+        let store = self.tkem_store.as_mut().ok_or_else(|| {
+            SignalProtocolError::InvalidState("ProtocolStore", "No TKEM store configured".into())
+        })?;
+        store.save_remote_tkem_public_key(address, public_key).await
+    }
+
+    async fn get_remote_tkem_public_key(
+        &self,
+        address: &ProtocolAddress,
+    ) -> Result<Option<crate::kem::TagPublicKey>> {
+        let store = self.tkem_store.as_ref().ok_or_else(|| {
+            SignalProtocolError::InvalidState("ProtocolStore", "No TKEM store configured".into())
+        })?;
+        store.get_remote_tkem_public_key(address).await
+    }
+}

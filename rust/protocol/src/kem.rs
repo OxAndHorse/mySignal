@@ -337,13 +337,16 @@ impl TagKeyType {
     fn value(&self) -> u8 {
         match self {
             TagKeyType::TKyber1024 => 0x0B, // 新增：分配唯一标识
-
+            #[cfg(feature = "tkem1024")]
+            TagKeyType::TKEM1024 => 0x0C,
         }
     }
 
     const fn parameters(&self) -> &'static dyn DynTagParameters{
         match self {
             TagKeyType::TKyber1024 => &tkyber1024::TagParameters,
+            #[cfg(feature = "tkem1024")]
+            TagKeyType::TKEM1024 => &tkyber1024::TagParameters, // TKyber1024 parameters used for TKEM1024 type since they are likely the same
         }
     }
 }
@@ -393,6 +396,8 @@ impl TryFrom<u8> for TagKeyType {
     fn try_from(x: u8) -> Result<Self> {
         match x {
             0x0B => Ok(TagKeyType::TKyber1024),
+            #[cfg(feature = "tkem1024")]
+            0x0C => Ok(TagKeyType::TKEM1024),
             t => Err(SignalProtocolError::BadKEMKeyType(t)),
         }
     }

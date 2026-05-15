@@ -137,6 +137,86 @@ pub(crate) fn initialize_alice_session<R: Rng + CryptoRng>(
     Ok(session)
 }
 
+#[cfg(feature = "tkem1024")]
+pub(crate) fn initialize_alice_session_tkem<R: Rng + CryptoRng>(
+    parameters: &AliceSignalProtocolParameters,
+    mut csprng: &mut R,
+) -> Result<SessionState> {
+    use sha2::Digest as _;
+
+    let local_identity = parameters.our_identity_key_pair().identity_key();
+
+    let mut secrets = Vec::with_capacity(32 * 6);
+    secrets.extend_from_slice(&[0xFFu8; 32]); // "discontinuity bytes"
+
+    let our_base_private_key = parameters.our_base_key_pair().private_key;
+
+    secrets.extend_from_slice(
+        &parameters
+            .our_identity_key_pair()
+            .private_key()
+            .calculate_agreement(parameters.their_signed_pre_key())?,
+    );
+    secrets.extend_from_slice(
+        &our_base_private_key.calculate_agreement(parameters.their_identity_key().public_key())?,
+    );
+    secrets.extend_from_slice(
+        &our_base_private_key.calculate_agreement(parameters.their_signed_pre_key())?,
+    );
+
+    if let Some(their_one_time_prekey) = parameters.their_one_time_pre_key() {
+        secrets.extend_from_slice(&our_base_private_key.calculate_agreement(their_one_time_prekey)?);
+    }
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"PQ-TAG");
+    hasher.update(parameters.our_base_key_pair().public_key.serialize()); // EPKA
+    hasher.update(parameters.their_identity_key().public_key().serialize()); // IPKB
+    hasher.update(local_identity.public_key().serialize()); // IPKA
+    let tag = hasher.finalize().to_vec();
+
+    let their_tkem_master_key = parameters
+        .their_tkem_master_key()
+        .ok_or_else(|| {
+            SignalProtocolError::InvalidArgument(
+                "missing TKEM master key for Alice session init".to_string(),
+            )
+        })?;
+    let (_ss, tkem_ciphertext) =
+        their_tkem_master_key.encapsulate_with_tag(&mut csprng, &tag)?;
+    
+    secrets.extend_from_slice(
+        &_ss,
+    );
+
+    let (root_key, chain_key, _initial_pqr_key) = derive_keys_with_label(
+        b"WhisperText_X25519_SHA-256_ML-TKEM-1024",
+        &secrets,
+    );
+
+    let sending_ratchet_key = KeyPair::generate(&mut csprng);
+    let (sending_chain_root_key, sending_chain_chain_key) = root_key.create_chain(
+        parameters.their_ratchet_key(),
+        &sending_ratchet_key.private_key,
+    )?;
+
+    let mut session = SessionState::new(
+        CIPHERTEXT_MESSAGE_CURRENT_VERSION,
+        local_identity,
+        parameters.their_identity_key(),
+        &sending_chain_root_key,
+        &parameters.our_base_key_pair().public_key,
+        spqr::SerializedState::new(),
+    )
+    .with_receiver_chain(parameters.their_ratchet_key(), &chain_key)
+    .with_sender_chain(&sending_ratchet_key, &sending_chain_chain_key);
+
+    session.set_tkem_ciphertext(tkem_ciphertext);
+    session.set_tkem_tag(tag);
+
+    Ok(session)
+}
+
 pub(crate) fn initialize_bob_session(
     parameters: &BobSignalProtocolParameters,
 ) -> Result<SessionState> {
@@ -179,7 +259,7 @@ pub(crate) fn initialize_bob_session(
         &parameters
             .our_kyber_pre_key_pair()
             .secret_key
-            .decapsulate(parameters.their_kyber_ciphertext())?,
+            .decapsulate(parameters.their_kyber_ciphertext().ok_or(SignalProtocolError::InvalidArgument("missing kyber ciphertext".to_string()))?)?,
     );
 
     let (root_key, chain_key, pqr_key) = derive_keys(&secrets);
@@ -219,6 +299,76 @@ pub(crate) fn initialize_bob_session(
     Ok(session)
 }
 
+#[cfg(feature = "tkem1024")]
+pub(crate) fn initialize_bob_session_tkem(
+    parameters: &BobSignalProtocolParameters,
+) -> Result<SessionState> {
+    let local_identity = parameters.our_identity_key_pair().identity_key();
+
+    let mut secrets = Vec::with_capacity(32 * 6);
+    secrets.extend_from_slice(&[0xFFu8; 32]); // "discontinuity bytes"
+
+    secrets.extend_from_slice(
+        &parameters
+            .our_signed_pre_key_pair()
+            .private_key
+            .calculate_agreement(parameters.their_identity_key().public_key())?,
+    );
+    secrets.extend_from_slice(
+        &parameters
+            .our_identity_key_pair()
+            .private_key()
+            .calculate_agreement(parameters.their_base_key())?,
+    );
+    secrets.extend_from_slice(
+        &parameters
+            .our_signed_pre_key_pair()
+            .private_key
+            .calculate_agreement(parameters.their_base_key())?,
+    );
+
+    if let Some(our_one_time_pre_key_pair) = parameters.our_one_time_pre_key_pair() {
+        secrets.extend_from_slice(
+            &our_one_time_pre_key_pair
+                .private_key
+                .calculate_agreement(parameters.their_base_key())?,
+        );
+    }
+
+    let our_tkem_key_pair = parameters.our_tkem_key_pair().ok_or_else(|| {
+        SignalProtocolError::InvalidArgument("missing local TKEM key pair".to_string())
+    })?;
+    let their_tkem_ciphertext = parameters.their_tkem_ciphertext().ok_or_else(|| {
+        SignalProtocolError::InvalidArgument("missing remote TKEM ciphertext".to_string())
+    })?;
+    let their_tkem_tag = parameters.their_tkem_tag().ok_or_else(|| {
+        SignalProtocolError::InvalidArgument("missing remote TKEM tag".to_string())
+    })?;
+
+    let their_tkem_ciphertext_box: Box<[u8]> = their_tkem_ciphertext.into();
+    let tkem_ss = our_tkem_key_pair
+        .tagsecret_key
+        .decapsulate_with_tag(&their_tkem_ciphertext_box, their_tkem_tag)?;
+    secrets.extend_from_slice(tkem_ss.as_ref());
+
+    let (root_key, chain_key, _initial_pqr_key) = derive_keys_with_label(
+        b"WhisperText_X25519_SHA-256_ML-TKEM-1024",
+        &secrets,
+    );
+
+    let session = SessionState::new(
+        CIPHERTEXT_MESSAGE_CURRENT_VERSION,
+        local_identity,
+        parameters.their_identity_key(),
+        &root_key,
+        parameters.their_base_key(),
+        spqr::SerializedState::new(),
+    )
+    .with_sender_chain(parameters.our_ratchet_key_pair(), &chain_key);
+
+    Ok(session)
+}
+
 pub fn initialize_alice_session_record<R: Rng + CryptoRng>(
     parameters: &AliceSignalProtocolParameters,
     csprng: &mut R,
@@ -232,4 +382,21 @@ pub fn initialize_bob_session_record(
     parameters: &BobSignalProtocolParameters,
 ) -> Result<SessionRecord> {
     Ok(SessionRecord::new(initialize_bob_session(parameters)?))
+}
+
+#[cfg(feature = "tkem1024")]
+pub fn initialize_alice_session_record_tkem<R: Rng + CryptoRng>(
+    parameters: &AliceSignalProtocolParameters,
+    csprng: &mut R,
+) -> Result<SessionRecord> {
+    Ok(SessionRecord::new(initialize_alice_session_tkem(
+        parameters, csprng,
+    )?))
+}
+
+#[cfg(feature = "tkem1024")]
+pub fn initialize_bob_session_record_tkem(
+    parameters: &BobSignalProtocolParameters,
+) -> Result<SessionRecord> {
+    Ok(SessionRecord::new(initialize_bob_session_tkem(parameters)?))
 }

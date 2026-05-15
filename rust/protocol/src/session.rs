@@ -262,3 +262,213 @@ pub async fn process_prekey_bundle<R: Rng + CryptoRng>(
 
     Ok(())
 }
+
+#[cfg(feature = "tkem1024")]
+pub async fn process_prekey_bundle_tkem<R: Rng + CryptoRng>(
+    remote_address: &ProtocolAddress,
+    session_store: &mut dyn SessionStore,
+    identity_store: &mut dyn IdentityKeyStore,
+    tkem_store: &mut dyn crate::storage::TkemStore,
+    bundle: &PreKeyBundle,
+    now: SystemTime,
+    mut csprng: &mut R,
+    use_pq_ratchet: ratchet::UsePQRatchet,
+) -> Result<()> {
+    let their_identity_key = bundle.identity_key()?;
+    if !identity_store
+        .is_trusted_identity(remote_address, their_identity_key, Direction::Sending)
+        .await?
+    {
+        return Err(SignalProtocolError::UntrustedIdentity(
+            remote_address.clone(),
+        ));
+    }
+    if !their_identity_key.public_key().verify_signature(
+        &bundle.signed_pre_key_public()?.serialize(),
+        bundle.signed_pre_key_signature()?,
+    ) {
+        return Err(SignalProtocolError::SignatureValidationFailed);
+    }
+    // verify tkem master key
+    if !their_identity_key.public_key().verify_signature(
+        &bundle.tkem_master_key_public()?.unwrap().serialize(),
+        bundle.tkem_master_key_signature()?.unwrap(),
+    ) {
+        return Err(SignalProtocolError::SignatureValidationFailed);
+    }
+
+    let mut session_record = session_store
+        .load_session(remote_address)
+        .await?
+        .unwrap_or_else(SessionRecord::new_fresh);
+
+    let our_base_key_pair = KeyPair::generate(&mut csprng);
+    let their_signed_prekey = bundle.signed_pre_key_public()?;
+    let their_tkem_master_key = bundle.tkem_master_key_public()?.unwrap().clone();
+
+    let their_one_time_prekey_id = bundle.pre_key_id()?;
+
+    let our_identity_key_pair = identity_store.get_identity_key_pair().await?;
+
+    let mut parameters = AliceSignalProtocolParameters::new_with_tkem(
+        our_identity_key_pair,
+        our_base_key_pair,
+        *their_identity_key,
+        their_signed_prekey,
+        their_signed_prekey,
+        their_tkem_master_key.clone(),
+        use_pq_ratchet,
+    );
+    if let Some(key) = bundle.pre_key_public()? {
+        parameters.set_their_one_time_pre_key(key);
+    }
+
+    let mut session = ratchet::initialize_alice_session_tkem(&parameters, csprng)?;
+
+    session.set_unacknowledged_pre_key_message(
+        their_one_time_prekey_id,
+        bundle.signed_pre_key_id()?,
+        &our_base_key_pair.public_key,
+        now,
+    );
+
+    session.set_local_registration_id(identity_store.get_local_registration_id().await?);
+    session.set_remote_registration_id(bundle.registration_id()?);
+
+    identity_store
+        .save_identity(remote_address, their_identity_key)
+        .await?;
+
+    tkem_store.save_remote_tkem_public_key(remote_address, &their_tkem_master_key).await?;
+
+    session_record.promote_state(session);
+
+    session_store
+        .store_session(remote_address, &session_record)
+        .await?;
+
+    Ok(())
+}
+
+#[cfg(feature = "tkem1024")]
+pub async fn process_prekey_tkem<'a>(
+    message: &'a PreKeySignalMessage,
+    remote_address: &'a ProtocolAddress,
+    session_record: &mut SessionRecord,
+    identity_store: &dyn IdentityKeyStore,
+    pre_key_store: &dyn PreKeyStore,
+    signed_prekey_store: &dyn SignedPreKeyStore,
+    tkem_store: &dyn crate::storage::TkemStore,
+    use_pq_ratchet: ratchet::UsePQRatchet,
+) -> Result<(PreKeysUsed, IdentityToSave<'a>)> {
+    let their_identity_key = message.identity_key();
+
+    if !identity_store
+        .is_trusted_identity(remote_address, their_identity_key, Direction::Receiving)
+        .await?
+    {
+        return Err(SignalProtocolError::UntrustedIdentity(
+            remote_address.clone(),
+        ));
+    }
+
+    let pre_keys_used = process_prekey_impl_tkem(
+        message,
+        remote_address,
+        session_record,
+        signed_prekey_store,
+        tkem_store,
+        pre_key_store,
+        identity_store,
+        use_pq_ratchet,
+    )
+    .await?;
+
+    let identity_to_save = IdentityToSave {
+        remote_address,
+        their_identity_key,
+    };
+
+    Ok((pre_keys_used, identity_to_save))
+}
+
+#[cfg(feature = "tkem1024")]
+async fn process_prekey_impl_tkem(
+    message: &PreKeySignalMessage,
+    _remote_address: &ProtocolAddress,
+    session_record: &mut SessionRecord,
+    signed_prekey_store: &dyn SignedPreKeyStore,
+    tkem_store: &dyn crate::storage::TkemStore,
+    pre_key_store: &dyn PreKeyStore,
+    identity_store: &dyn IdentityKeyStore,
+    use_pq_ratchet: ratchet::UsePQRatchet,
+) -> Result<PreKeysUsed> {
+    if session_record.promote_matching_session(
+        message.message_version() as u32,
+        &message.base_key().serialize(),
+    )? {
+        return Ok(Default::default());
+    }
+
+    if message.message_version() == CIPHERTEXT_MESSAGE_PRE_KYBER_VERSION {
+        return Err(SignalProtocolError::InvalidMessage(
+            CiphertextMessageType::PreKey,
+            "X3DH no longer supported",
+        ));
+    }
+
+    let our_signed_pre_key_pair = signed_prekey_store
+        .get_signed_pre_key(message.signed_pre_key_id())
+        .await?
+        .key_pair()?;
+
+    let our_tkem_key_pair = tkem_store.get_tkem_key_pair().await?;
+
+    let tkem_ciphertext = message
+        .message()
+        .tkem_ciphertext()
+        .ok_or(SignalProtocolError::InvalidMessage(
+            CiphertextMessageType::PreKey,
+            "missing tkem ciphertext",
+        ))?;
+
+    let tkem_tag = message
+        .message()
+        .tag()
+        .ok_or(SignalProtocolError::InvalidMessage(
+            CiphertextMessageType::PreKey,
+            "missing tkem tag",
+        ))?;
+
+    let our_one_time_pre_key_pair = if let Some(pre_key_id) = message.pre_key_id() {
+        Some(pre_key_store.get_pre_key(pre_key_id).await?.key_pair()?)
+    } else {
+        None
+    };
+
+    let parameters = BobSignalProtocolParameters::new_with_tkem(
+        identity_store.get_identity_key_pair().await?,
+        our_signed_pre_key_pair, // signed pre key
+        our_one_time_pre_key_pair,
+        our_signed_pre_key_pair, // ratchet key
+        our_tkem_key_pair,
+        *message.identity_key(),
+        *message.base_key(),
+        tkem_ciphertext,
+        tkem_tag,
+        use_pq_ratchet,
+    );
+
+    let mut new_session = ratchet::initialize_bob_session_tkem(&parameters)?;
+
+    new_session.set_local_registration_id(identity_store.get_local_registration_id().await?);
+    new_session.set_remote_registration_id(message.registration_id());
+
+    session_record.promote_state(new_session);
+
+    let pre_keys_used = PreKeysUsed {
+        pre_key_id: message.pre_key_id(),
+        kyber_pre_key_id: None, // No kyber pre key for TKEM
+    };
+    Ok(pre_keys_used)
+}

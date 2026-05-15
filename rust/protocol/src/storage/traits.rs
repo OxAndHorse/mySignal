@@ -172,9 +172,36 @@ pub trait SenderKeyStore {
 }
 
 /// Mixes in all the store interfaces defined in this module.
+#[cfg(not(feature = "tkem1024"))]
 pub trait ProtocolStore:
     SessionStore + PreKeyStore + SignedPreKeyStore + KyberPreKeyStore + IdentityKeyStore
 {
+}
+
+/// Mixes in all the store interfaces defined in this module.
+#[cfg(feature = "tkem1024")]
+pub trait ProtocolStore:
+    SessionStore + PreKeyStore + SignedPreKeyStore + KyberPreKeyStore + IdentityKeyStore + TkemStore
+{
+}
+
+/// Interface for storing and retrieving TKEM keys.
+#[cfg(feature = "tkem1024")]
+#[async_trait(?Send)]
+pub trait TkemStore {
+    /// Return the identity-bound TKEM TagKeyPair.
+    async fn get_tkem_key_pair(&self) -> Result<crate::kem::TagKeyPair>;
+    /// Save a remote party's TKEM public key.
+    async fn save_remote_tkem_public_key(
+        &mut self,
+        address: &ProtocolAddress,
+        public_key: &crate::kem::TagPublicKey,
+    ) -> Result<()>;
+    /// Retrieve a previously saved TKEM public key for a remote party.
+    async fn get_remote_tkem_public_key(
+        &self,
+        address: &ProtocolAddress,
+    ) -> Result<Option<crate::kem::TagPublicKey>>;
 }
 
 impl IdentityChange {

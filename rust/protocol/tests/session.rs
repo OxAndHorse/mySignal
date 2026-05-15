@@ -3419,3 +3419,325 @@ fn x3dh_prekey_rejected_as_invalid_message_specifically() {
     .now_or_never()
     .expect("sync");
 }
+
+#[cfg(feature = "tkem1024")]
+#[test]
+fn test_tkem_basic_prekey_roundtrip() -> TestResult {
+    async {
+        let mut csprng = OsRng.unwrap_err();
+
+        let mut alice_store = test_in_memory_protocol_store_tkem()?;
+        let mut bob_store = test_in_memory_protocol_store_tkem()?;
+
+        let bob_bundle = create_pre_key_bundle_tkem(&mut bob_store, &mut csprng).await?;
+
+        let alice_address =
+            ProtocolAddress::new("+14151111111".to_owned(), DeviceId::new(1).unwrap());
+        let bob_address = ProtocolAddress::new("+14151111112".to_owned(), bob_bundle.device_id()?);
+
+        process_prekey_bundle_tkem(
+            &bob_address,
+            &mut alice_store.session_store,
+            &mut alice_store.identity_store,
+            alice_store
+                .tkem_store
+                .as_mut()
+                .expect("alice should have TKEM store"),
+            &bob_bundle,
+            SystemTime::now(),
+            &mut csprng,
+            UsePQRatchet::No,
+        )
+        .await?;
+
+        assert_eq!(alice_store.session_version(&bob_address)?, KYBER_AWARE_MESSAGE_VERSION);
+
+        let outgoing = encrypt_tkem(&mut alice_store, &bob_address, "hello tkem").await?;
+        match &outgoing {
+            CiphertextMessage::PreKeySignalMessage(m) => {
+                assert!(m.kyber_pre_key_id().is_none());
+                assert!(m.message().tkem_ciphertext().is_some());
+                assert!(m.message().tag().is_some());
+            }
+            _ => panic!("first TKEM message should be PreKeySignalMessage"),
+        }
+
+        let ptext = decrypt_tkem(
+            &mut bob_store,
+            &alice_address,
+            &outgoing,
+            UsePQRatchet::No,
+        )
+        .await?;
+        assert_eq!(String::from_utf8(ptext).expect("valid utf8"), "hello tkem");
+        assert_eq!(bob_store.session_version(&alice_address)?, KYBER_AWARE_MESSAGE_VERSION);
+
+        Ok(())
+    }
+    .now_or_never()
+    .expect("sync")
+}
+
+#[cfg(feature = "tkem1024")]
+#[test]
+fn test_tkem_bundle_saves_remote_master_public_key() -> TestResult {
+    async {
+        let mut csprng = OsRng.unwrap_err();
+        let mut alice_store = test_in_memory_protocol_store_tkem()?;
+        let mut bob_store = test_in_memory_protocol_store_tkem()?;
+        let bob_bundle = create_pre_key_bundle_tkem(&mut bob_store, &mut csprng).await?;
+
+        let bob_address = ProtocolAddress::new("+14151111112".to_owned(), bob_bundle.device_id()?);
+
+        process_prekey_bundle_tkem(
+            &bob_address,
+            &mut alice_store.session_store,
+            &mut alice_store.identity_store,
+            alice_store
+                .tkem_store
+                .as_mut()
+                .expect("alice should have TKEM store"),
+            &bob_bundle,
+            SystemTime::now(),
+            &mut csprng,
+            UsePQRatchet::No,
+        )
+        .await?;
+
+        let saved = alice_store
+            .get_remote_tkem_public_key(&bob_address)
+            .await?
+            .expect("remote TKEM key should be saved");
+        let bundle_key = bob_bundle
+            .tkem_master_key_public()?
+            .expect("bundle should contain tkem master key")
+            .clone();
+        assert!(saved == bundle_key);
+        Ok(())
+    }
+    .now_or_never()
+    .expect("sync")
+}
+
+#[cfg(feature = "tkem1024")]
+#[test]
+fn test_tkem_prekey_missing_tag_rejected() -> TestResult {
+    async {
+        let mut csprng = OsRng.unwrap_err();
+        let mut alice_store = test_in_memory_protocol_store_tkem()?;
+        let mut bob_store = test_in_memory_protocol_store_tkem()?;
+        let bob_bundle = create_pre_key_bundle_tkem(&mut bob_store, &mut csprng).await?;
+
+        let alice_address =
+            ProtocolAddress::new("+14151111111".to_owned(), DeviceId::new(1).unwrap());
+        let bob_address = ProtocolAddress::new("+14151111112".to_owned(), bob_bundle.device_id()?);
+
+        process_prekey_bundle_tkem(
+            &bob_address,
+            &mut alice_store.session_store,
+            &mut alice_store.identity_store,
+            alice_store
+                .tkem_store
+                .as_mut()
+                .expect("alice should have TKEM store"),
+            &bob_bundle,
+            SystemTime::now(),
+            &mut csprng,
+            UsePQRatchet::No,
+        )
+        .await?;
+
+        let outgoing = encrypt_tkem(&mut alice_store, &bob_address, "hello tkem").await?;
+        let original =
+            assert_matches!(outgoing, CiphertextMessage::PreKeySignalMessage(m) => m);
+        let original_signal = original.message().clone();
+        let mut mac_key = [0u8; 32];
+        csprng.fill_bytes(&mut mac_key);
+        let bob_identity = *bob_store.get_identity_key_pair().await?.identity_key();
+
+        let modified_signal = SignalMessage::new_with_tkem(
+            original_signal.message_version(),
+            &mac_key,
+            *original_signal.sender_ratchet_key(),
+            original_signal.counter(),
+            0,
+            original_signal.body(),
+            original.identity_key(),
+            &bob_identity,
+            original_signal.pq_ratchet(),
+            original_signal.tkem_ciphertext(),
+            None,
+        )?;
+
+        let modified_prekey = PreKeySignalMessage::new(
+            original.message_version(),
+            original.registration_id(),
+            original.pre_key_id(),
+            original.signed_pre_key_id(),
+            None,
+            *original.base_key(),
+            *original.identity_key(),
+            modified_signal,
+        )?;
+
+        let err = decrypt_tkem(
+            &mut bob_store,
+            &alice_address,
+            &CiphertextMessage::PreKeySignalMessage(modified_prekey),
+            UsePQRatchet::No,
+        )
+        .await
+        .expect_err("message without tkem tag should be rejected");
+
+        assert_matches!(
+            err,
+            SignalProtocolError::InvalidMessage(CiphertextMessageType::PreKey, msg)
+            if msg.contains("missing tkem tag")
+        );
+        Ok(())
+    }
+    .now_or_never()
+    .expect("sync")
+}
+
+#[cfg(feature = "tkem1024")]
+#[test]
+fn test_tkem_prekey_missing_ciphertext_rejected() -> TestResult {
+    async {
+        let mut csprng = OsRng.unwrap_err();
+        let mut alice_store = test_in_memory_protocol_store_tkem()?;
+        let mut bob_store = test_in_memory_protocol_store_tkem()?;
+        let bob_bundle = create_pre_key_bundle_tkem(&mut bob_store, &mut csprng).await?;
+
+        let alice_address =
+            ProtocolAddress::new("+14151111111".to_owned(), DeviceId::new(1).unwrap());
+        let bob_address = ProtocolAddress::new("+14151111112".to_owned(), bob_bundle.device_id()?);
+
+        process_prekey_bundle_tkem(
+            &bob_address,
+            &mut alice_store.session_store,
+            &mut alice_store.identity_store,
+            alice_store
+                .tkem_store
+                .as_mut()
+                .expect("alice should have TKEM store"),
+            &bob_bundle,
+            SystemTime::now(),
+            &mut csprng,
+            UsePQRatchet::No,
+        )
+        .await?;
+
+        let outgoing = encrypt_tkem(&mut alice_store, &bob_address, "hello tkem").await?;
+        let original =
+            assert_matches!(outgoing, CiphertextMessage::PreKeySignalMessage(m) => m);
+        let original_signal = original.message().clone();
+        let mut mac_key = [0u8; 32];
+        csprng.fill_bytes(&mut mac_key);
+        let bob_identity = *bob_store.get_identity_key_pair().await?.identity_key();
+
+        let modified_signal = SignalMessage::new_with_tkem(
+            original_signal.message_version(),
+            &mac_key,
+            *original_signal.sender_ratchet_key(),
+            original_signal.counter(),
+            0,
+            original_signal.body(),
+            original.identity_key(),
+            &bob_identity,
+            original_signal.pq_ratchet(),
+            None,
+            original_signal.tag(),
+        )?;
+
+        let modified_prekey = PreKeySignalMessage::new(
+            original.message_version(),
+            original.registration_id(),
+            original.pre_key_id(),
+            original.signed_pre_key_id(),
+            None,
+            *original.base_key(),
+            *original.identity_key(),
+            modified_signal,
+        )?;
+
+        let err = decrypt_tkem(
+            &mut bob_store,
+            &alice_address,
+            &CiphertextMessage::PreKeySignalMessage(modified_prekey),
+            UsePQRatchet::No,
+        )
+        .await
+        .expect_err("message without tkem ciphertext should be rejected");
+
+        assert_matches!(
+            err,
+            SignalProtocolError::InvalidMessage(CiphertextMessageType::PreKey, msg)
+            if msg.contains("missing tkem ciphertext")
+        );
+        Ok(())
+    }
+    .now_or_never()
+    .expect("sync")
+}
+
+#[cfg(feature = "tkem1024")]
+#[test]
+fn test_tkem_bundle_bad_master_signature_rejected() -> TestResult {
+    async {
+        let mut csprng = OsRng.unwrap_err();
+        let mut alice_store = test_in_memory_protocol_store_tkem()?;
+        let mut bob_store = test_in_memory_protocol_store_tkem()?;
+        let good_bundle = create_pre_key_bundle_tkem(&mut bob_store, &mut csprng).await?;
+        let bob_address =
+            ProtocolAddress::new("+14151111112".to_owned(), good_bundle.device_id()?);
+
+        let mut bad_tkem_signature = good_bundle
+            .tkem_master_key_signature()?
+            .expect("tkem signature should exist")
+            .to_vec();
+        bad_tkem_signature[0] ^= 0x01;
+
+        let bad_bundle = PreKeyBundle::new_with_tkem(
+            good_bundle.registration_id()?,
+            good_bundle.device_id()?,
+            good_bundle
+                .pre_key_id()?
+                .zip(good_bundle.pre_key_public()?)
+                .map(|(id, pk)| (id, pk)),
+            good_bundle.signed_pre_key_id()?,
+            good_bundle.signed_pre_key_public()?,
+            good_bundle.signed_pre_key_signature()?.to_vec(),
+            good_bundle
+                .tkem_master_key_id()?
+                .expect("tkem master key id should exist"),
+            good_bundle
+                .tkem_master_key_public()?
+                .expect("tkem master key should exist")
+                .clone(),
+            bad_tkem_signature,
+            *good_bundle.identity_key()?,
+        )?;
+
+        let err = process_prekey_bundle_tkem(
+            &bob_address,
+            &mut alice_store.session_store,
+            &mut alice_store.identity_store,
+            alice_store
+                .tkem_store
+                .as_mut()
+                .expect("alice should have TKEM store"),
+            &bad_bundle,
+            SystemTime::now(),
+            &mut csprng,
+            UsePQRatchet::No,
+        )
+        .await
+        .expect_err("bad tkem master signature should be rejected");
+
+        assert_matches!(err, SignalProtocolError::SignatureValidationFailed);
+        Ok(())
+    }
+    .now_or_never()
+    .expect("sync")
+}

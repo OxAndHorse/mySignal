@@ -14,7 +14,11 @@ pub use inmem::{
     InMemIdentityKeyStore, InMemKyberPreKeyStore, InMemPreKeyStore, InMemSenderKeyStore,
     InMemSessionStore, InMemSignalProtocolStore, InMemSignedPreKeyStore,
 };
+#[cfg(feature = "tkem1024")]
+pub use inmem::InMemTkemStore;
 pub use traits::{
     Direction, IdentityChange, IdentityKeyStore, KyberPreKeyStore, PreKeyStore, ProtocolStore,
     SenderKeyStore, SessionStore, SignedPreKeyStore,
 };
+#[cfg(feature = "tkem1024")]
+pub use traits::TkemStore;

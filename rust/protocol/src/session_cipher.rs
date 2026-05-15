@@ -11,7 +11,7 @@ use crate::consts::{MAX_FORWARD_JUMPS, MAX_UNACKNOWLEDGED_SESSION_AGE};
 use crate::ratchet::{ChainKey, MessageKeyGenerator, UsePQRatchet};
 use crate::state::{InvalidSessionError, SessionState};
 use crate::{
-    session, CiphertextMessage, CiphertextMessageType, Direction, IdentityKeyStore, KeyPair,
+    kem, session, CiphertextMessage, CiphertextMessageType, Direction, IdentityKeyStore, KeyPair,
     KyberPayload, KyberPreKeyStore, PreKeySignalMessage, PreKeyStore, ProtocolAddress, PublicKey,
     Result, SessionRecord, SessionStore, SignalMessage, SignalProtocolError, SignedPreKeyStore,
 };
@@ -835,4 +835,501 @@ fn get_or_create_message_key(
 
     state.set_receiver_chain_key(their_ephemeral, &chain_key.next_chain_key())?;
     Ok(chain_key.message_keys())
+}
+
+#[cfg(feature = "tkem1024")]
+pub async fn message_encrypt_tkem<R: Rng + CryptoRng>(
+    ptext: &[u8],
+    remote_address: &ProtocolAddress,
+    session_store: &mut dyn SessionStore,
+    identity_store: &mut dyn IdentityKeyStore,
+    tkem_store: &mut dyn crate::storage::TkemStore,
+    now: SystemTime,
+    csprng: &mut R,
+) -> Result<CiphertextMessage> {
+    let mut session_record = session_store
+        .load_session(remote_address)
+        .await?
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
+    let session_state = session_record
+        .session_state_mut()
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
+
+    let chain_key = session_state.get_sender_chain_key()?;
+
+    let sender_ephemeral = session_state.sender_ratchet_key()?;
+    let previous_counter = session_state.previous_counter();
+    let session_version = session_state
+        .session_version()?
+        .try_into()
+        .map_err(|_| SignalProtocolError::InvalidSessionStructure("version does not fit in u8"))?;
+
+    let local_identity_key = session_state.local_identity_key()?;
+    let their_identity_key = session_state.remote_identity_key()?.ok_or_else(|| {
+        SignalProtocolError::InvalidState(
+            "message_encrypt_tkem",
+            format!("no remote identity key for {remote_address}"),
+        )
+    })?;
+
+    // Determine tkem ciphertext and tag. For the first message, we use the ones from session creation if present.
+    // Wait, the first message might be responding to a prekey, or initiating.
+    // Actually, Alice sent a prekey bundle so Alice is writing to Bob.
+    // If we have an unacknowledged pre-key message, we USE the tkem ciphertext generated during initialize_alice_session_tkem
+    // But we ALSO need a pqr_key for this specific message. Let's just generate a new one per message.
+    let remote_tkem_pub = tkem_store.get_remote_tkem_public_key(remote_address).await?.ok_or_else(|| {
+        SignalProtocolError::InvalidState("message_encrypt_tkem", "No remote TKEM public key found".into())
+    })?;
+
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"PQ-TAG");
+    hasher.update(sender_ephemeral.serialize()); // EPKA
+    hasher.update(their_identity_key.public_key().serialize()); // IPKB
+    hasher.update(local_identity_key.public_key().serialize()); // IPKA
+    let computed_tag = hasher.finalize();
+
+    let (pqr_key, tkem_ciphertext, tag) = if let Some(_) = session_state.unacknowledged_pre_key_message_items()? {
+        let tkem_ct = session_state.get_tkem_ciphertext().unwrap().clone();
+        let tkem_t = session_state.get_tkem_tag().unwrap().clone();
+        (None, tkem_ct, tkem_t)
+    } else {
+        let (ss, ct) = remote_tkem_pub.encapsulate_with_tag(csprng, &computed_tag).map_err(|e| {
+            SignalProtocolError::InvalidState("message_encrypt_tkem", format!("TKEM encapsulate failed: {e}"))
+        })?;
+        (Some(ss.into_vec()), ct.as_ref().to_vec(), computed_tag.to_vec())
+    };
+
+    let message_keys = chain_key
+        .message_keys()
+        .generate_keys(pqr_key);
+
+    let ctext = signal_crypto::aes_256_cbc_encrypt(ptext, message_keys.cipher_key(), message_keys.iv())
+            .map_err(|_| {
+                log::error!("session state corrupt for {remote_address}");
+                SignalProtocolError::InvalidSessionStructure("invalid sender chain message keys")
+            })?;
+
+    let message = if let Some(items) = session_state.unacknowledged_pre_key_message_items()? {
+        let _timestamp_as_unix_time = items
+            .timestamp()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if items.timestamp() + MAX_UNACKNOWLEDGED_SESSION_AGE < now {
+            return Err(SignalProtocolError::SessionNotFound(remote_address.clone()));
+        }
+
+        let local_registration_id = session_state.local_registration_id();
+
+        let message = SignalMessage::new_with_tkem(
+            session_version,
+            message_keys.mac_key(),
+            sender_ephemeral,
+            chain_key.index(),
+            previous_counter,
+            &ctext,
+            &local_identity_key,
+            &their_identity_key,
+            &[],
+            Some(tkem_ciphertext.as_ref()),
+            Some(tag.as_slice()),
+        )?;
+
+        CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::new(
+            session_version,
+            local_registration_id,
+            items.pre_key_id(),
+            items.signed_pre_key_id(),
+            None, // No kyber payload
+            *items.base_key(),
+            local_identity_key,
+            message,
+        )?)
+    } else {
+        CiphertextMessage::SignalMessage(SignalMessage::new_with_tkem(
+            session_version,
+            message_keys.mac_key(),
+            sender_ephemeral,
+            chain_key.index(),
+            previous_counter,
+            &ctext,
+            &local_identity_key,
+            &their_identity_key,
+            &[],
+            Some(tkem_ciphertext.as_ref()),
+            Some(tag.as_slice()),
+        )?)
+    };
+
+    session_state.set_sender_chain_key(&chain_key.next_chain_key());
+
+    if !identity_store
+        .is_trusted_identity(remote_address, &their_identity_key, Direction::Sending)
+        .await?
+    {
+        return Err(SignalProtocolError::UntrustedIdentity(
+            remote_address.clone(),
+        ));
+    }
+
+    identity_store
+        .save_identity(remote_address, &their_identity_key)
+        .await?;
+
+    session_store
+        .store_session(remote_address, &session_record)
+        .await?;
+    Ok(message)
+}
+
+#[cfg(feature = "tkem1024")]
+#[allow(clippy::too_many_arguments)]
+pub async fn message_decrypt_tkem<R: Rng + CryptoRng>(
+    ciphertext: &CiphertextMessage,
+    remote_address: &ProtocolAddress,
+    session_store: &mut dyn SessionStore,
+    identity_store: &mut dyn IdentityKeyStore,
+    pre_key_store: &mut dyn PreKeyStore,
+    signed_pre_key_store: &dyn SignedPreKeyStore,
+    tkem_store: &mut dyn crate::storage::TkemStore,
+    csprng: &mut R,
+    use_pq_ratchet: UsePQRatchet,
+) -> Result<Vec<u8>> {
+    match ciphertext {
+        CiphertextMessage::SignalMessage(m) => {
+            message_decrypt_signal_tkem(m, remote_address, session_store, identity_store, tkem_store, csprng).await
+        }
+        CiphertextMessage::PreKeySignalMessage(m) => {
+            message_decrypt_prekey_tkem(
+                m,
+                remote_address,
+                session_store,
+                identity_store,
+                pre_key_store,
+                signed_pre_key_store,
+                tkem_store,
+                csprng,
+                use_pq_ratchet,
+            )
+            .await
+        }
+        _ => Err(SignalProtocolError::InvalidArgument(format!(
+            "message_decrypt_tkem cannot be used to decrypt {:?} messages",
+            ciphertext.message_type()
+        ))),
+    }
+}
+
+#[cfg(feature = "tkem1024")]
+#[allow(clippy::too_many_arguments)]
+pub async fn message_decrypt_prekey_tkem<R: Rng + CryptoRng>(
+    ciphertext: &PreKeySignalMessage,
+    remote_address: &ProtocolAddress,
+    session_store: &mut dyn SessionStore,
+    identity_store: &mut dyn IdentityKeyStore,
+    pre_key_store: &mut dyn PreKeyStore,
+    signed_pre_key_store: &dyn SignedPreKeyStore,
+    tkem_store: &mut dyn crate::storage::TkemStore,
+    csprng: &mut R,
+    use_pq_ratchet: UsePQRatchet,
+) -> Result<Vec<u8>> {
+    let mut session_record = session_store
+        .load_session(remote_address)
+        .await?
+        .unwrap_or_else(SessionRecord::new_fresh);
+
+    let process_prekey_result = session::process_prekey_tkem(
+        ciphertext,
+        remote_address,
+        &mut session_record,
+        identity_store,
+        pre_key_store,
+        signed_pre_key_store,
+        tkem_store,
+        use_pq_ratchet,
+    )
+    .await;
+
+    let (pre_key_used, identity_to_save) = match process_prekey_result {
+        Ok(result) => result,
+        Err(e) => {
+            return Err(e);
+        }
+    };
+
+    let ptext = decrypt_message_with_record_tkem(
+        remote_address,
+        &mut session_record,
+        ciphertext.message(),
+        CiphertextMessageType::PreKey,
+        tkem_store,
+        csprng,
+    ).await?;
+
+    identity_store
+        .save_identity(
+            identity_to_save.remote_address,
+            identity_to_save.their_identity_key,
+        )
+        .await?;
+
+    session_store
+        .store_session(remote_address, &session_record)
+        .await?;
+
+    if let Some(pre_key_id) = pre_key_used.pre_key_id {
+        pre_key_store.remove_pre_key(pre_key_id).await?;
+    }
+
+    Ok(ptext)
+}
+
+#[cfg(feature = "tkem1024")]
+pub async fn message_decrypt_signal_tkem<R: Rng + CryptoRng>(
+    ciphertext: &SignalMessage,
+    remote_address: &ProtocolAddress,
+    session_store: &mut dyn SessionStore,
+    identity_store: &mut dyn IdentityKeyStore,
+    tkem_store: &mut dyn crate::storage::TkemStore,
+    csprng: &mut R,
+) -> Result<Vec<u8>> {
+    let mut session_record = session_store
+        .load_session(remote_address)
+        .await?
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
+
+    let ptext = decrypt_message_with_record_tkem(
+        remote_address,
+        &mut session_record,
+        ciphertext,
+        CiphertextMessageType::Whisper,
+        tkem_store,
+        csprng,
+    ).await?;
+
+    let their_identity_key = session_record
+        .session_state()
+        .expect("successfully decrypted; must have a current state")
+        .remote_identity_key()
+        .expect("successfully decrypted; must have a remote identity key")
+        .expect("successfully decrypted; must have a remote identity key");
+
+    if !identity_store
+        .is_trusted_identity(remote_address, &their_identity_key, Direction::Receiving)
+        .await?
+    {
+        return Err(SignalProtocolError::UntrustedIdentity(
+            remote_address.clone(),
+        ));
+    }
+
+    identity_store
+        .save_identity(remote_address, &their_identity_key)
+        .await?;
+
+    session_store
+        .store_session(remote_address, &session_record)
+        .await?;
+
+    Ok(ptext)
+}
+
+#[cfg(feature = "tkem1024")]
+async fn decrypt_message_with_record_tkem<R: Rng + CryptoRng>(
+    remote_address: &ProtocolAddress,
+    record: &mut SessionRecord,
+    ciphertext: &SignalMessage,
+    original_message_type: CiphertextMessageType,
+    tkem_store: &dyn crate::storage::TkemStore,
+    csprng: &mut R,
+) -> Result<Vec<u8>> {
+    let mut errs = vec![];
+
+    if let Some(current_state) = record.session_state() {
+        let mut current_state = current_state.clone();
+        let result = decrypt_message_with_state_tkem(
+            CurrentOrPrevious::Current,
+            &mut current_state,
+            ciphertext,
+            original_message_type,
+            remote_address,
+            tkem_store,
+            csprng,
+        ).await;
+
+        match result {
+            Ok(ptext) => {
+                record.set_session_state(current_state);
+                return Ok(ptext);
+            }
+            Err(SignalProtocolError::DuplicatedMessage(_, _)) => {
+                return result;
+            }
+            Err(e) => {
+                errs.push(e);
+                match original_message_type {
+                    CiphertextMessageType::PreKey => {
+                        return Err(SignalProtocolError::InvalidMessage(
+                            original_message_type,
+                            "decryption failed",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut updated_session = None;
+
+    for (idx, previous) in record.previous_session_states().enumerate() {
+        let mut previous = previous?;
+
+        let result = decrypt_message_with_state_tkem(
+            CurrentOrPrevious::Previous,
+            &mut previous,
+            ciphertext,
+            original_message_type,
+            remote_address,
+            tkem_store,
+            csprng,
+        ).await;
+
+        match result {
+            Ok(ptext) => {
+                updated_session = Some((ptext, idx, previous));
+                break;
+            }
+            Err(SignalProtocolError::DuplicatedMessage(_, _)) => {
+                return result;
+            }
+            Err(e) => {
+                errs.push(e);
+            }
+        }
+    }
+
+    if let Some((ptext, idx, updated_session)) = updated_session {
+        record.promote_old_session(idx, updated_session);
+        Ok(ptext)
+    } else {
+        Err(SignalProtocolError::InvalidMessage(
+            original_message_type,
+            "decryption failed",
+        ))
+    }
+}
+
+#[cfg(feature = "tkem1024")]
+async fn decrypt_message_with_state_tkem<R: Rng + CryptoRng>(
+    _current_or_previous: CurrentOrPrevious,
+    state: &mut SessionState,
+    ciphertext: &SignalMessage,
+    original_message_type: CiphertextMessageType,
+    remote_address: &ProtocolAddress,
+    tkem_store: &dyn crate::storage::TkemStore,
+    csprng: &mut R,
+) -> Result<Vec<u8>> {
+    let _ = state.root_key().map_err(|_| {
+        SignalProtocolError::InvalidMessage(
+            original_message_type,
+            "No session available to decrypt",
+        )
+    })?;
+
+    let ciphertext_version = ciphertext.message_version() as u32;
+    if ciphertext_version != state.session_version()? {
+        return Err(SignalProtocolError::UnrecognizedMessageVersion(
+            ciphertext_version,
+        ));
+    }
+
+    let their_ephemeral = ciphertext.sender_ratchet_key();
+    let counter = ciphertext.counter();
+    let chain_key = get_or_create_chain_key(state, their_ephemeral, remote_address, csprng)?;
+    let message_key_gen = get_or_create_message_key(
+        state,
+        their_ephemeral,
+        remote_address,
+        original_message_type,
+        &chain_key,
+        counter,
+    )?;
+
+    let tkem_key_pair = tkem_store.get_tkem_key_pair().await?;
+
+    let tkem_ciphertext: kem::SerializedCiphertext = ciphertext
+        .tkem_ciphertext()
+        .ok_or(SignalProtocolError::InvalidMessage(
+            original_message_type,
+            "missing tkem ciphertext",
+        ))?
+        .to_vec()
+        .into_boxed_slice();
+    
+    let tag = ciphertext.tag()
+        .ok_or(SignalProtocolError::InvalidMessage(original_message_type, "missing tkem tag"))?;
+
+    let pqr_key_raw = tkem_key_pair
+        .tagsecret_key
+        .decapsulate_with_tag(&tkem_ciphertext, tag)
+        .map_err(|e| {
+            SignalProtocolError::InvalidState(
+                "decrypt_message_with_state",
+                format!("TKEM decapsulate failed: {e}"),
+            )
+        })?;
+
+    let pqr_key_to_use = match original_message_type {
+        CiphertextMessageType::PreKey => None,
+        _ => Some(pqr_key_raw.into_vec()),
+    };
+
+    let message_keys = message_key_gen.generate_keys(pqr_key_to_use.clone());
+
+    println!("BOB dec: pqr_key={:?}, mac_key={:?}", pqr_key_to_use.map(|k| hex::encode(k)), hex::encode(message_keys.mac_key()));
+
+    let their_identity_key =
+        state
+            .remote_identity_key()?
+            .ok_or(SignalProtocolError::InvalidSessionStructure(
+                "cannot decrypt without remote identity key",
+            ))?;
+
+    let mac_valid = ciphertext.verify_mac(
+        &their_identity_key,
+        &state.local_identity_key()?,
+        message_keys.mac_key(),
+    )?;
+
+    if !mac_valid {
+        return Err(SignalProtocolError::InvalidMessage(
+            original_message_type,
+            "MAC verification failed",
+        ));
+    }
+
+    let ptext = match signal_crypto::aes_256_cbc_decrypt(
+        ciphertext.body(),
+        message_keys.cipher_key(),
+        message_keys.iv(),
+    ) {
+        Ok(ptext) => ptext,
+        Err(signal_crypto::DecryptionError::BadKeyOrIv) => {
+            return Err(SignalProtocolError::InvalidSessionStructure(
+                "invalid receiver chain message keys",
+            ));
+        }
+        Err(signal_crypto::DecryptionError::BadCiphertext(_)) => {
+            return Err(SignalProtocolError::InvalidMessage(
+                original_message_type,
+                "failed to decrypt",
+            ));
+        }
+    };
+
+    state.clear_unacknowledged_pre_key_message();
+
+    Ok(ptext)
 }
